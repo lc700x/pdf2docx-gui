@@ -17,9 +17,33 @@ No file leaves your machine — everything is converted locally.
 - 🖱️ **Drag & drop** a PDF onto the window, or pick one with **Browse…**
 - 📄 Choose the output `.docx` location (defaults beside the source PDF)
 - ⚙️ Converts in a **background thread** — the UI stays responsive
-- 🖼️ **Images** and **tables** are preserved with layout fidelity
+- 🖼️ **Images** are preserved with layout fidelity
+- 🔢 **Tables and equations kept as images** cropped from the PDF, so their
+  layout survives intact — see below
+- 💻 **`--cli`** for scripting, with no window
 - 📦 Works on **Windows, macOS, and Linux**
 - 🚀 Zero cloud dependency, fully offline
+
+---
+
+## Tables and equations as images
+
+A PDF holds positioned glyphs, not formulas. A converter has to guess where a
+summation's limits or a fraction's numerator belong, and when it guesses wrong
+the equation comes apart — taking any table built around one with it.
+
+With **Tables and equations as images** ticked (the default), those regions are
+cropped from the PDF at 300 dpi and placed in the document, so they look exactly
+as they do in the PDF. Everything else is untouched: body text stays text, and
+so do captions, which sit outside the crop and remain searchable.
+
+Regions are found on the page itself — tables by the rules that frame them,
+equations by being set apart from the margin and mostly set in math fonts — and
+each crop replaces the converted content it actually came from, matched by text.
+
+Turn it off when the tables matter more than the formulas do. **A journal
+submission usually needs editable tables**, so check the instructions for
+authors before sending a file with images in place of tables.
 
 ---
 
@@ -63,16 +87,44 @@ python pdf2docx_gui.py
 1. **Launch** the app.
 2. **Drop** a PDF onto the window (or click **Browse…**).
 3. Confirm the **output path** (defaults to `<source-name>.docx`).
-4. Click **Convert**.
-5. Open the `.docx` in Word / LibreOffice / Google Docs.
+4. Decide whether to keep **tables and equations as images** (on by default).
+5. Click **Convert**.
+6. Open the `.docx` in Word / LibreOffice / Google Docs.
+
+### From a script
+
+```bash
+python pdf2docx_gui.py --cli input.pdf [output.docx] [--no-images]
+```
+
+`--no-images` converts tables and equations as text, as the tool did before.
+
+---
+
+## Checking the result
+
+A conversion can fail quietly: text is dropped, a caption disappears into a
+cropped table, and nothing raises an error. `check.py` reads the PDF a page at
+a time and reports what became of that page's words.
+
+```bash
+python check.py source.pdf converted.docx
+```
+
+It compares content, not layout, so it needs only the two files. Run it after
+every conversion; it exits non-zero when anything is missing, so it can gate a
+batch.
 
 ---
 
 ## Project layout
 
-```
+```text
 pdf2docx-gui/
 ├── pdf2docx_gui.py      # the application (Tkinter GUI + conversion)
+├── snip_regions.py      # finds tables and equations, crops them from the PDF
+├── polish.py            # fonts, page flow, lost spaces, alignment
+├── check.py             # compares the result against the PDF, page by page
 ├── requirements.txt     # dependencies
 ├── run_windows.bat      # Windows launcher (auto venv setup)
 ├── run_macos.sh         # macOS/Linux launcher (auto venv setup)
@@ -87,8 +139,12 @@ The tool uses [`pdf2docx`](https://github.com/ArtifexSoftware/pdf2docx),
 which is built on **PyMuPDF** (rendering & text extraction) and
 **python-docx** (Word document generation). It parses each PDF page into
 text blocks, vector shapes, and embedded images, then reassembles them
-into a native `.docx` — keeping tables and figures as real Word objects
-rather than flattened screenshots.
+into a native `.docx`.
+
+`snip_regions.py` then looks at the PDF again for the regions that survive
+conversion badly, and replaces each with a crop of the page. `polish.py`
+repairs what conversion page by page leaves behind — substituted fonts, the
+per-page sections, the spaces lost from justified lines.
 
 ---
 
@@ -100,6 +156,32 @@ rather than flattened screenshots.
   activity but not a percentage.
 - Scanned/image-only PDFs will not produce selectable text (OCR is not
   included).
+- A cropped table or equation is a picture: it does not reflow, its text is
+  not searchable, and it cannot be edited in Word. `check.py` lists its words
+  as missing, which is expected — everything else it lists is not.
+- A table that runs across a PDF page boundary is cropped once per page, so a
+  repeated header row appears twice.
+- Where the text reflows, page breaks no longer fall where the PDF put them.
+  A break is kept only where the PDF page stopped early or the next page opens
+  a section.
+
+### What goes wrong, and what the tool does about it
+
+Every one of these was a real defect found by comparing output against the
+source page by page. They are recorded because the next PDF will have them too.
+
+| What goes wrong | Why | What the tool does |
+| --- | --- | --- |
+| Text looks a size too large | The .docx names TeX fonts nobody has installed, so Word substitutes something wider | Rewrites them to Times New Roman and Courier New |
+| A blank page after almost every page | Each PDF page becomes its own section, ending with the page number as body text; reflowed text runs a little long and spills | Moves the page number into a real footer and drops the per-page sections |
+| A gap in the middle of a sentence | The paragraph that carried a section break stays behind as an empty paragraph | Removes empty paragraphs left between text |
+| Whole lines run together as one word | Justified lines are set with squeezed spacing, and below a threshold the extractor reads the gap as no gap | Restores the space between runs, judged against the document's own vocabulary and any `.tex`/`.bbl` beside the PDF |
+| The right margin is ragged | pdf2docx reads alignment off where the ink falls, so body text arrives left-aligned | Justifies paragraphs long enough to wrap, and only those |
+| A heading stretched across the page | It shares a paragraph with the text under it, and justification pulls its single line apart | Leaves any paragraph holding a line break unjustified |
+| A figure split across two pages | Nothing holds its panels and caption together once the text flows | Keeps panels, captions and images with what follows |
+| The paper starts on the title page | Removing the per-page sections removed the deliberate breaks with the rest | Keeps a break where the PDF page ended early, or the next page opens a section |
+| A caption vanishes into a crop | It repeats the wording of the table it describes, so it scores as part of it | Holds captions out of the match by name |
+| A paragraph beside a table disappears | It named the same methods as the table, and overlap alone was taken as belonging | Requires one text to account for nearly all of the other, and trusts a converted table row over a sentence |
 
 ---
 
