@@ -39,16 +39,13 @@ def normalise(text):
 def docx_words(path):
     document = Document(path)
     parts = []
-    for paragraph in document.paragraphs:
-        parts.append(paragraph.text)
-    for table in document.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                parts.append(cell.text)
-    # equations live outside the text API
+    body = document.element.body
     math_t = '{http://schemas.openxmlformats.org/officeDocument/2006/math}t'
-    for node in document.element.body.iter(math_t):
-        parts.append(node.text or '')
+    for node in body.iter():
+        if node.tag in (qn('w:t'), math_t):
+            parts.append(node.text or '')
+        elif node.tag == qn('wp:docPr'):
+            parts.append(node.get('descr') or '')
     return normalise(' '.join(parts))
 
 
@@ -101,6 +98,10 @@ def check_images(docx_path):
 
 
 def main(argv):
+    # Some Windows consoles cannot encode names from the source document.
+    # Escape only unrepresentable characters so diagnostics still complete.
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(errors='backslashreplace')
     if len(argv) < 2:
         print(__doc__.strip())
         return 2

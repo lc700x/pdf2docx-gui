@@ -19,6 +19,7 @@ None of this changes a single character of the text.
 """
 
 import re
+import unicodedata
 import zipfile
 from collections import Counter
 
@@ -306,6 +307,7 @@ LETTER = r'[^\W\d_]'                     # any letter, including math italics
 TAIL = re.compile(LETTER + r"(?:" + LETTER + r"|['-])*$", re.UNICODE)
 HEAD = re.compile(r"^" + LETTER + r"(?:" + LETTER + r"|['-])*", re.UNICODE)
 WORD = re.compile(LETTER + r"(?:" + LETTER + r"|['-])+", re.UNICODE)
+SOURCE_WORD = re.compile(LETTER + r"(?:" + LETTER + r"|['-])*", re.UNICODE)
 
 LABELS = {'figure', 'table', 'section', 'appendix', 'equation', 'fig', 'eq',
           'chapter', 'january', 'february', 'march', 'april', 'may', 'june',
@@ -348,6 +350,25 @@ def build_vocabulary(document, extra_paths=()):
     return vocab
 
 
+def source_word_boundaries(pdf_path):
+    """Words and adjacent pairs the PDF itself separates with whitespace."""
+    import fitz
+
+    words, pairs = set(), set()
+    with fitz.open(pdf_path) as pdf:
+        for page in pdf:
+            lines = {}
+            for item in page.get_text('words'):
+                lines.setdefault((item[5], item[6]), []).append(item[4])
+            for line in lines.values():
+                tokens = [token.casefold() for text in line
+                          for token in SOURCE_WORD.findall(
+                              unicodedata.normalize('NFKC', text))]
+                words.update(tokens)
+                pairs.update(zip(tokens, tokens[1:]))
+    return words, pairs
+
+
 def _is_shifted(run):
     rpr = run._r.find(qn('w:rPr'))
     if rpr is None:
@@ -357,7 +378,8 @@ def _is_shifted(run):
                                                             'subscript')
 
 
-def _needs_space(before, after, run_after, vocab):
+def _needs_space(before, after, run_after, vocab,
+                 source_words=(), source_pairs=()):
     if not before or not after:
         return False
     if before[-1].isspace() or after[0].isspace():
@@ -382,6 +404,11 @@ def _needs_space(before, after, run_after, vocab):
     tail, head = TAIL.search(before), HEAD.match(after)
     if not tail:
         return False
+    if head:
+        left, right = tail.group(0).casefold(), head.group(0).casefold()
+        joined = left + right
+        if ((left, right) in source_pairs and joined not in source_words):
+            return True
     if not head:                                      # a symbol, such as math
         return tail.group(0).lower() in vocab
     joined = (tail.group(0) + head.group(0)).lower()
@@ -390,7 +417,7 @@ def _needs_space(before, after, run_after, vocab):
     return tail.group(0).lower() in vocab or head.group(0).lower() in vocab
 
 
-def restore_spaces(document, vocab):
+def restore_spaces(document, vocab, source_words=(), source_pairs=()):
     """Put back the space between runs that the extractor read as no space."""
     restored = 0
 
@@ -400,7 +427,8 @@ def restore_spaces(document, vocab):
             runs = paragraph.runs
             for i in range(len(runs) - 1):
                 before, after = runs[i].text, runs[i + 1].text
-                if _needs_space(before, after, runs[i + 1], vocab):
+                if _needs_space(before, after, runs[i + 1], vocab,
+                                source_words, source_pairs):
                     runs[i].text = before + ' '
                     restored += 1
 
@@ -465,7 +493,11 @@ def polish(docx_path, pdf_path=None, vocab_paths=(), justify=True):
     folios, breaks, blanks, kept, held = flow_pages(
         document, keep_breaks=keep_breaks)
     vocab = build_vocabulary(document, vocab_paths)
-    spaces = restore_spaces(document, vocab)
+    if pdf_path:
+        source_words, source_pairs = source_word_boundaries(pdf_path)
+    else:
+        source_words, source_pairs = set(), set()
+    spaces = restore_spaces(document, vocab, source_words, source_pairs)
     justified, relaxed = justify_body(document) if justify else (0, 0)
     document.save(docx_path)
 

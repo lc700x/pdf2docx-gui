@@ -156,9 +156,9 @@ per-page sections, the spaces lost from justified lines.
   activity but not a percentage.
 - Scanned/image-only PDFs will not produce selectable text (OCR is not
   included).
-- A cropped table or equation is a picture: it does not reflow, its text is
-  not searchable, and it cannot be edited in Word. `check.py` lists its words
-  as missing, which is expected — everything else it lists is not.
+- A cropped table or equation is a picture: it does not reflow, and it cannot
+  be edited as a Word table or equation. Its extracted text is stored in the
+  image description for accessibility and content checking.
 - A table that runs across a PDF page boundary is cropped once per page, so a
   repeated header row appears twice.
 - Where the text reflows, page breaks no longer fall where the PDF put them.

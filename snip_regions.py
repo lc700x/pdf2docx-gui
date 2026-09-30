@@ -275,6 +275,25 @@ def _cover(key, target):
     return score
 
 
+def _word_cover(text, target):
+    """Compare prose by words so a fragment cannot match inside a word."""
+    token_re = r"[^\W\d_]+(?:['-][^\W\d_]+)*"
+    source = [word.casefold() for word in re.findall(token_re, text)]
+    wanted = [word.casefold() for word in re.findall(token_re, target)]
+    if not source or not wanted:
+        return _cover(_key(text), _key(target))
+    matcher = SequenceMatcher(None, source, wanted, autojunk=False)
+    common = sum(block.size for block in matcher.get_matching_blocks())
+    return max(common / len(source), common / len(wanted))
+
+
+def _element_cover(element, target):
+    text = _element_text(element)
+    if element.tag == qn('w:p'):
+        return _word_cover(text, target)
+    return _cover(_key(text), _key(target))
+
+
 def _assign(elements, regions):
     """Which elements each region was converted into.
 
@@ -289,7 +308,6 @@ def _assign(elements, regions):
 
     Returns, per region, the list of element indices to replace, or None.
     """
-    targets = [_key(text) for text in regions]
     captions = [bool(CAPTION.match(_element_text(e).strip())) for e in elements]
     # A converted table is a table; prose never is. That alone separates a row
     # of a table from a sentence that happens to name the same method, which no
@@ -301,10 +319,9 @@ def _assign(elements, regions):
     for i, element in enumerate(elements):
         if captions[i]:
             continue
-        key = _key(_element_text(element))
         best, score = None, bars[i]
-        for r, target in enumerate(targets):
-            cover = _cover(key, target)
+        for r, target in enumerate(regions):
+            cover = _element_cover(element, target)
             if cover > score:
                 best, score = r, cover
         owner[i] = best
@@ -329,7 +346,8 @@ def _assign(elements, regions):
                 continue
             key = _key(_element_text(elements[i]))
             bar = MIN_COVER_TABLE if bars[i] == MIN_COVER_TABLE else INTERIOR_COVER
-            if len(key) < MIN_ANCHOR or _cover(key, targets[r]) >= bar:
+            if (len(key) < MIN_ANCHOR
+                    or _element_cover(elements[i], regions[r]) >= bar):
                 keep.append(i)
         groups.append(keep)
     return groups
@@ -338,7 +356,27 @@ def _assign(elements, regions):
 
 
 
-def _insert_image(elements, indices, png, width_pt, document):
+def _remove_cropped_table_rows(table, target):
+    """Drop rows covered by the crop but retain adjacent text and headings."""
+    target = _key(target).casefold()
+    removed = 0
+    for row in list(table.findall(qn('w:tr'))):
+        cells = [_key(_element_text(cell)).casefold()
+                 for cell in row.findall(qn('w:tc'))]
+        cells = [key for key in cells
+                 if len(key) >= 3 or (len(key) >= 2 and key.isdigit())]
+        if not cells:
+            continue
+        matched = sum(key in target or _cover(key, target) >= 0.9
+                      for key in cells)
+        if matched * 3 >= len(cells) * 2:
+            table.remove(row)
+            removed += 1
+    return removed
+
+
+def _insert_image(elements, indices, png, width_pt, document, target,
+                  description='', preserve_table_rows=False):
     """Put the crop where the matched elements were, and drop them."""
     anchor = elements[indices[0]]
     new_p = anchor.makeelement(qn('w:p'), {})
@@ -347,12 +385,19 @@ def _insert_image(elements, indices, png, width_pt, document):
     from docx.text.paragraph import Paragraph
     paragraph = Paragraph(new_p, document)
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.add_run().add_picture(png, width=Pt(width_pt))
+    picture = paragraph.add_run().add_picture(png, width=Pt(width_pt))
+    if description:
+        picture._inline.docPr.set('descr', description)
 
     for index in indices:
         element = elements[index]
         parent = element.getparent()
-        if parent is not None:
+        if (parent is not None and element.tag == qn('w:tbl')
+                and preserve_table_rows):
+            _remove_cropped_table_rows(element, target)
+            if not element.findall(qn('w:tr')):
+                parent.remove(element)
+        elif parent is not None:
             parent.remove(element)
     return new_p
 
@@ -393,8 +438,8 @@ def snip(pdf_path, docx_path, dpi=300, tables=True, equations=True,
 
             # Later regions first, so that removing one region's elements does
             # not disturb the elements of the regions still to come.
-            for (kind, rect), indices in sorted(
-                    zip(regions, groups),
+            for (kind, rect), indices, target in sorted(
+                    zip(regions, groups, wanted),
                     key=lambda item: -(item[1][0] if item[1] else 0)):
                 if not indices:
                     missed += 1
@@ -409,7 +454,10 @@ def snip(pdf_path, docx_path, dpi=300, tables=True, equations=True,
                 tmp.append(png)
 
                 width = min(box.width, right - left)
-                _insert_image(elements, indices, png, width, document)
+                description = page.get_textbox(box).strip()
+                _insert_image(elements, indices, png, width, document,
+                              target, description,
+                              preserve_table_rows=(kind == 'table'))
                 replaced += 1
 
             if progress:
