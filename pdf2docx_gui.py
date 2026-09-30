@@ -1,13 +1,26 @@
 import os
 import sys
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 
 from pdf2docx import Converter
 
+import polish as polish_module
+import snip_regions
+
+SNIP_DPI = 300
+
+
+def _vocab_beside(src):
+    """Source files next to the PDF that name the words it uses."""
+    stem = os.path.splitext(src)[0]
+    return [p for p in (stem + '.tex', stem + '.bbl') if os.path.exists(p)]
+
 
 def build_app():
+    # Imported here, not at module level: --cli runs on installs without Tk.
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
     try:
         from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
@@ -15,8 +28,8 @@ def build_app():
         root = tk.Tk()
 
     root.title("PDF → DOCX Converter")
-    root.geometry("560x260")
-    root.minsize(500, 240)
+    root.geometry("560x330")
+    root.minsize(500, 310)
 
     pdf_path = {"value": None}
     out_path = {"value": None}
@@ -73,7 +86,23 @@ def build_app():
             cv = Converter(src)
             cv.convert(dst, start=0, end=None)
             cv.close()
-            status.set("Done.")
+
+            note = "Done."
+            if var_snip.get():
+                status.set("Cropping tables and equations…")
+                replaced, missed = snip_regions.snip(
+                    src, dst, dpi=SNIP_DPI,
+                    tables=True, equations=True)
+                note = f"Done. {replaced} tables and equations kept as images"
+                if missed:
+                    note += f", {missed} left as converted text"
+                note += "."
+            if var_polish.get():
+                status.set("Tidying the document…")
+                counts = polish_module.polish(dst, src, _vocab_beside(src))
+                note += (f" Restored {counts['spaces']} spaces,"
+                         f" removed {counts['page breaks']} page breaks.")
+            status.set(note)
         except Exception as exc:
             status.set("Failed.")
             root.after(0, lambda: messagebox.showerror("Error", str(exc)))
@@ -103,6 +132,30 @@ def build_app():
     tk.Entry(frame, textvariable=var_out).grid(row=2, column=1, sticky="we", pady=(14, 0))
     tk.Button(frame, text="Save as…", command=pick_out).grid(row=2, column=2, padx=6, pady=(14, 0))
 
+    var_snip = tk.BooleanVar(value=True)
+    tk.Checkbutton(
+        frame,
+        text="Tables and equations as images from the PDF",
+        variable=var_snip, anchor="w",
+    ).grid(row=3, column=1, columnspan=2, sticky="w", pady=(10, 0))
+    tk.Label(
+        frame,
+        text="Keeps their layout exactly; body text stays editable.",
+        fg="#888", anchor="w",
+    ).grid(row=4, column=1, columnspan=2, sticky="w")
+
+    var_polish = tk.BooleanVar(value=True)
+    tk.Checkbutton(
+        frame,
+        text="Tidy the document for reading and editing",
+        variable=var_polish, anchor="w",
+    ).grid(row=5, column=1, columnspan=2, sticky="w", pady=(8, 0))
+    tk.Label(
+        frame,
+        text="Substitutes missing fonts, lets the text flow, restores lost spaces.",
+        fg="#888", anchor="w",
+    ).grid(row=6, column=1, columnspan=2, sticky="w")
+
     frame.columnconfigure(1, weight=1)
 
     btn_frame = tk.Frame(root)
@@ -119,16 +172,49 @@ def build_app():
     root.drop_target_register("DND_Files")
     root.dnd_bind("<<Drop>>", on_drop)
 
+    root.set_input = set_input      # so a PDF named on the command line loads
     return root
 
 
+def convert_cli(src, dst, snip=True, tidy=True):
+    """Convert without opening the window, for scripting and for testing."""
+    cv = Converter(src)
+    cv.convert(dst, start=0, end=None)
+    cv.close()
+    if snip:
+        replaced, missed = snip_regions.snip(src, dst, dpi=SNIP_DPI)
+        print(f"{replaced} tables and equations kept as images"
+              + (f", {missed} left as converted text" if missed else ""))
+    if tidy:
+        counts = polish_module.polish(dst, src, _vocab_beside(src))
+        print(', '.join(f'{name}: {value}' for name, value in counts.items()))
+    print(dst)
+
+
 def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = {a for a in sys.argv[1:] if a.startswith("-")}
+
+    if "--cli" in flags:
+        if not args:
+            print("usage: pdf2docx_gui.py --cli input.pdf [output.docx] "
+                  "[--no-images] [--no-tidy]")
+            return 2
+        src = os.path.abspath(args[0])
+        dst = os.path.abspath(args[1]) if len(args) > 1 \
+            else os.path.splitext(src)[0] + ".docx"
+        convert_cli(src, dst,
+                    snip="--no-images" not in flags,
+                    tidy="--no-tidy" not in flags)
+        return 0
+
     root = build_app()
-    if len(sys.argv) > 1 and sys.argv[1].lower().endswith(".pdf"):
-        pdf = os.path.abspath(sys.argv[1])
-        root.after(100, lambda: set_input(pdf))
+    if args and args[0].lower().endswith(".pdf"):
+        pdf = os.path.abspath(args[0])
+        root.after(100, lambda: root.set_input(pdf))
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
