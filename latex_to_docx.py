@@ -23,6 +23,10 @@ _BIBLIOGRAPHY_PATTERN = re.compile(
 )
 _ENVIRONMENT_PATTERN = re.compile(r"\\(begin|end)\s*\{([^}]+)\}")
 _CAPTION_PATTERN = re.compile(r"\\caption(?![A-Za-z])(\*)?")
+_LABEL_PATTERN = re.compile(r"\\label\s*\{([^}]+)\}")
+_SECTION_COMMAND_PATTERN = re.compile(
+    r"\\(subparagraph|subsubsection|subsection|paragraph|chapter|section|part)"
+    r"(\*)?(?![A-Za-z])")
 
 _PAPER_SIZES = {
     "a4paper": (Mm(210), Mm(297)),
@@ -265,8 +269,10 @@ def _wide_subfigure_ranges(text):
         if cursor < len(text) and text[cursor] == "[":
             _, cursor = _read_tex_group(text, cursor, "[", "]")
         width, _ = _read_tex_group(text, cursor, "{", "}")
-        ratio = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*\\textwidth\s*", width or "")
-        if not ratio or float(ratio.group(1)) < 0.5:
+        ratio = re.fullmatch(
+            r"\s*(?:(\d+(?:\.\d+)?)\s*)?\\textwidth\s*", width or "")
+        ratio_value = float(ratio.group(1) or 1) if ratio else 0
+        if not ratio or ratio_value < 0.5:
             continue
 
         depth = 1
@@ -275,7 +281,7 @@ def _wide_subfigure_ranges(text):
                 continue
             depth += 1 if closing.group(1) == "begin" else -1
             if not depth:
-                ranges.append((match.start(), closing.end(), ratio.group(1)))
+                ranges.append((match.start(), closing.end(), str(ratio_value)))
                 break
     return ranges
 
@@ -475,8 +481,130 @@ def _figure_caption_records(text):
             records.append({
                 "caption": caption,
                 "prefix": f"Figure {figure_number}.",
+                "number": figure_number,
+                "float": block,
             })
     return records
+
+
+def _read_section_command(text, match):
+    cursor = match.end()
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor < len(text) and text[cursor] == "[":
+        _, cursor = _read_tex_group(text, cursor, "[", "]")
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    title, cursor = _read_tex_group(text, cursor, "{", "}")
+    if title is None:
+        return None
+
+    labels = []
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        label = _LABEL_PATTERN.match(text, cursor)
+        if not label:
+            break
+        labels.append(label.group(1).strip())
+        cursor = label.end()
+    return title, cursor, labels
+
+
+def _section_label_aliases(source_text):
+    text = _strip_tex_comments(source_text)
+    aliases = {}
+    for match in _SECTION_COMMAND_PATTERN.finditer(text):
+        record = _read_section_command(text, match)
+        if record is None:
+            continue
+        _, _, labels = record
+        if labels:
+            aliases.update({label: labels[0] for label in labels[1:]})
+    return aliases
+
+
+def _appendix_heading_records(source_text):
+    """Build the lettered heading sequence after LaTeX's appendix switch."""
+    text = _strip_tex_comments(source_text)
+    appendix = re.search(r"\\appendix\b", text)
+    if not appendix:
+        return [], {}
+
+    level_by_command = {
+        "section": 1, "subsection": 2, "subsubsection": 3,
+    }
+    records = []
+    labels = {}
+    appendix_number = 0
+    appendix_letter = None
+    counters = {2: 0, 3: 0}
+    for match in _SECTION_COMMAND_PATTERN.finditer(text, appendix.end()):
+        command, starred = match.groups()
+        level = level_by_command.get(command)
+        if level is None:
+            continue
+        parsed = _read_section_command(text, match)
+        if parsed is None:
+            continue
+        title, _, heading_labels = parsed
+
+        prefix = None
+        if not starred:
+            if level == 1:
+                appendix_number += 1
+                number = appendix_number
+                letter = ""
+                while number:
+                    number, remainder = divmod(number - 1, 26)
+                    letter = chr(ord("A") + remainder) + letter
+                appendix_letter = letter
+                counters = {2: 0, 3: 0}
+                prefix = f"Appendix {appendix_letter}"
+            elif appendix_letter is not None:
+                counters[level] += 1
+                for lower_level in range(level + 1, 4):
+                    counters[lower_level] = 0
+                suffix = ".".join(
+                    str(counters[item]) for item in range(2, level + 1))
+                prefix = f"{appendix_letter}.{suffix}"
+        if prefix and heading_labels:
+            number_text = prefix.removeprefix("Appendix ")
+            labels.update({label: number_text for label in heading_labels})
+        records.append({
+            "level": level,
+            "prefix": prefix,
+            "title": title,
+        })
+    return records, labels
+
+
+def _table_reference_numbers(source_text):
+    numbers = {}
+    for record in _table_float_records(source_text):
+        if record["starred"]:
+            continue
+        active_float = _strip_tex_comments(record["float"])
+        for label in _LABEL_PATTERN.findall(active_float):
+            numbers[label.strip()] = str(record["number"])
+    return numbers
+
+
+def _figure_reference_numbers(source_text):
+    numbers = {}
+    for record in _figure_caption_records(_strip_tex_comments(source_text)):
+        block = record["float"]
+        subfigures = _named_environment_ranges(block, {"subfigure"})
+        for match in _LABEL_PATTERN.finditer(block):
+            if _is_comment_offset(block, match.start()):
+                continue
+            subfigure = next((index for index, (start, end) in enumerate(
+                subfigures, start=1) if start < match.start() < end), None)
+            number = str(record["number"])
+            if subfigure is not None:
+                number += chr(ord("a") + subfigure - 1)
+            numbers[match.group(1).strip()] = number
+    return numbers
 
 
 def _table_float_records(text):
@@ -645,6 +773,66 @@ def _normalize_minipage_tables(text):
     return text
 
 
+def _normalize_tabular_rows(text):
+    """Join table cells split across source lines before Pandoc reads them."""
+    for start, end in reversed(_named_environment_ranges(
+            text, {"tabular", "tabularx"})):
+        block = text[start:end]
+        lines = block.splitlines()
+        normalized = []
+        for line in lines:
+            if line.lstrip().startswith("&"):
+                previous = next((index for index in range(len(normalized) - 1, -1, -1)
+                                 if normalized[index].strip()
+                                 and not normalized[index].lstrip().startswith("%")), None)
+                if (previous is not None
+                        and not re.search(r"\\\\(?:\[[^]]*\])?\s*$",
+                                          normalized[previous])):
+                    normalized[previous] = normalized[previous].rstrip() + " " + line.strip()
+                    continue
+            normalized.append(line)
+        text = text[:start] + "\n".join(normalized) + text[end:]
+    return text
+
+
+def _normalize_subfigure_tabularx(text):
+    """Convert subfigure tabularx blocks to Pandoc-friendly markup."""
+    for start, end in reversed(_named_environment_ranges(text, {"subfigure"})):
+        block = _normalize_tabular_rows(text[start:end])
+        text = text[:start] + block + text[end:]
+    subfigure_ranges = _named_environment_ranges(text, {"subfigure"})
+    table_ranges = _named_environment_ranges(text, {"tabularx"})
+    for start, end in reversed(table_ranges):
+        if not any(left < start and end < right
+                   for left, right in subfigure_ranges):
+            continue
+        block = text[start:end]
+        begin = next((match for match in _ENVIRONMENT_PATTERN.finditer(block)
+                      if match.groups() == ("begin", "tabularx")
+                      and not _is_comment_offset(block, match.start())), None)
+        finish = next((match for match in reversed(list(
+            _ENVIRONMENT_PATTERN.finditer(block)))
+                       if match.groups() == ("end", "tabularx")
+                       and not _is_comment_offset(block, match.start())), None)
+        if begin is None or finish is None:
+            continue
+        _, cursor = _read_tex_group(block, begin.end(), "{", "}")
+        spec, cursor = _read_tex_group(block, cursor, "{", "}")
+        if spec is None:
+            continue
+        content = block[cursor:finish.start()]
+        content = re.sub(
+            r"\\(?:toprule|midrule|bottomrule|addlinespace)\*?"
+            r"(?:\s*\[[^]]*\])?", "", content)
+        content = re.sub(
+            r"\\(?:cmidrule|cline)\*?(?:\[[^]]*\])?"
+            r"(?:\([^)]*\))?\s*\{[^}]*\}", "", content)
+        replacement = ("\\begin{tabular}{" + _simplify_column_spec(spec) + "}"
+                       + content + "\\end{tabular}")
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
 def _standalone_table_sources(record, source_text):
     """Build standalone sources for each native table in a LaTeX float."""
     block = record["float"]
@@ -692,6 +880,300 @@ def _standalone_table_sources(record, source_text):
             + table + "\n\\end{document}\n")
         consumed_until = end_match.end()
     return sources
+
+
+def _table_column_specs(record):
+    """Read width-bearing tabular column specifications from a float."""
+    block = record["float"]
+    environments = [match for match in _ENVIRONMENT_PATTERN.finditer(block)
+                    if not _is_comment_offset(block, match.start())]
+    specs = []
+    for match in environments:
+        if match.group(1) != "begin" or match.group(2) not in ("tabularx", "tabular"):
+            continue
+        cursor = match.end()
+        table_width = None
+        if match.group(2) == "tabularx":
+            table_width, cursor = _read_tex_group(block, cursor, "{", "}")
+        column_spec, _ = _read_tex_group(block, cursor, "{", "}")
+        if column_spec is not None:
+            specs.append((table_width, column_spec))
+    return specs
+
+
+def _column_width_expressions(spec):
+    columns = []
+    index = 0
+    while index < len(spec):
+        character = spec[index]
+        if character.isspace() or character == "|":
+            index += 1
+            continue
+        if spec.startswith(">{", index):
+            _, index = _read_tex_group(spec, index + 1, "{", "}")
+            continue
+        if character == "<":
+            if index + 1 < len(spec) and spec[index + 1] == "{":
+                _, index = _read_tex_group(spec, index + 1, "{", "}")
+            else:
+                index += 1
+            continue
+        if character in "pmb":
+            width, index = _read_tex_group(spec, index + 1, "{", "}")
+            columns.append(width)
+            continue
+        if character in "lcrXY":
+            columns.append(None)
+            index += 1
+            continue
+        if character == "*":
+            count, index = _read_tex_group(spec, index + 1, "{", "}")
+            repeated, index = _read_tex_group(spec, index, "{", "}")
+            if count and repeated:
+                try:
+                    columns.extend(_column_width_expressions(repeated) * int(count))
+                except ValueError:
+                    pass
+            continue
+        if character in "@!":
+            _, index = _read_tex_group(spec, index + 1, "{", "}")
+            continue
+        if character == "\\":
+            command = re.match(r"\\[A-Za-z]+", spec[index:])
+            index += len(command.group(0)) if command else 2
+            continue
+        index += 1
+    return columns
+
+
+def _tex_width_inches(expression, reference_width):
+    if expression is None:
+        return None
+    expression = expression.strip()
+    relative = re.fullmatch(
+        r"(-?(?:\d+(?:\.\d*)?|\.\d+))\s*\\(?:linewidth|textwidth|columnwidth)",
+        expression,
+    )
+    if relative:
+        return float(relative.group(1)) * reference_width
+    if expression in (r"\linewidth", r"\textwidth", r"\columnwidth"):
+        return reference_width
+    return _length_in_inches(expression)
+
+
+def _column_widths_inches(table_width_expression, column_spec, text_width):
+    table_width = _tex_width_inches(table_width_expression, text_width)
+    expressions = _column_width_expressions(column_spec)
+    widths = [_tex_width_inches(value, text_width) for value in expressions]
+    if not widths or not any(width is not None for width in widths):
+        return None
+    if table_width is None:
+        return None
+
+    fixed_total = sum(width for width in widths if width is not None)
+    flexible_count = sum(width is None for width in widths)
+    if fixed_total > table_width and fixed_total:
+        scale = table_width / fixed_total
+        widths = [width * scale if width is not None else None for width in widths]
+        fixed_total = table_width
+    if flexible_count:
+        flexible_width = max(0.0, table_width - fixed_total) / flexible_count
+        widths = [flexible_width if width is None else width for width in widths]
+    elif fixed_total < table_width:
+        scale = table_width / fixed_total
+        widths = [width * scale for width in widths]
+    return widths
+
+
+def _set_table_column_widths(table_element, widths):
+    grid = table_element.find(qn("w:tblGrid"))
+    if grid is None:
+        return False
+    columns = list(grid.findall(qn("w:gridCol")))
+    if len(columns) != len(widths):
+        return False
+    twips = [max(1, round(width * 1440)) for width in widths]
+    table_properties = table_element.find(qn("w:tblPr"))
+    if table_properties is None:
+        table_properties = OxmlElement("w:tblPr")
+        table_element.insert(0, table_properties)
+    table_width = table_properties.find(qn("w:tblW"))
+    if table_width is None:
+        table_width = OxmlElement("w:tblW")
+        table_properties.insert(0, table_width)
+    table_width.set(qn("w:w"), str(sum(twips)))
+    table_width.set(qn("w:type"), "dxa")
+    layout = table_properties.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        table_properties.append(layout)
+    layout.set(qn("w:type"), "fixed")
+
+    for column, width in zip(columns, twips):
+        column.set(qn("w:w"), str(width))
+    for row in table_element.findall(qn("w:tr")):
+        cell_widths = []
+        column_index = 0
+        for cell in row.findall(qn("w:tc")):
+            cell_properties = cell.find(qn("w:tcPr"))
+            span = (cell_properties.find(qn("w:gridSpan"))
+                    if cell_properties is not None else None)
+            span = int(span.get(qn("w:val"))) if span is not None else 1
+            if column_index + span > len(twips):
+                break
+            cell_widths.append((cell, sum(twips[column_index:column_index + span])))
+            column_index += span
+        if column_index != len(twips):
+            continue
+        for cell, width in cell_widths:
+            cell_properties = cell.find(qn("w:tcPr"))
+            if cell_properties is None:
+                cell_properties = OxmlElement("w:tcPr")
+                cell.insert(0, cell_properties)
+            cell_width = cell_properties.find(qn("w:tcW"))
+            if cell_width is None:
+                cell_width = OxmlElement("w:tcW")
+                cell_properties.insert(0, cell_width)
+            cell_width.set(qn("w:w"), str(width))
+            cell_width.set(qn("w:type"), "dxa")
+    return True
+
+
+def _preserve_latex_table_widths(source_text, output_path):
+    """Apply explicit LaTeX table widths to the corresponding editable Word tables."""
+    document = Document(output_path)
+    section = document.sections[0]
+    text_width = (section.page_width - section.left_margin - section.right_margin) / 914400
+    body = document.element.body
+    children = list(body)
+    changed = False
+
+    for record in _table_float_records(source_text):
+        if record["starred"]:
+            continue
+        source_widths = [
+            widths for table_width, column_spec in _table_column_specs(record)
+            if (widths := _column_widths_inches(
+                table_width, column_spec, text_width)) is not None
+        ]
+        if not source_widths:
+            continue
+        marker = f"Table {record['number']}."
+        caption_index = next((index for index, element in enumerate(children)
+                              if element.tag == qn("w:p")
+                              and Paragraph(element, document).text.strip().startswith(marker)),
+                             None)
+        if caption_index is None:
+            continue
+
+        tables = []
+        for element in children[caption_index + 1:]:
+            if element.tag == qn("w:p") and re.match(
+                    r"^Table\s+\d+\.", Paragraph(element, document).text.strip()):
+                break
+            if (element.tag == qn("w:tbl")
+                    and not element.findall(".//" + qn("w:drawing"))):
+                tables.append(element)
+        for table_element, widths in zip(tables, source_widths):
+            changed = _set_table_column_widths(table_element, widths) or changed
+
+    if changed:
+        document.save(output_path)
+
+
+def _subfigure_blocks(figure_record):
+    blocks = []
+    figure = figure_record["float"]
+    for start, end in _named_environment_ranges(figure, {"subfigure"}):
+        block = figure[start:end]
+        begin = next((match for match in _ENVIRONMENT_PATTERN.finditer(block)
+                      if match.groups() == ("begin", "subfigure")
+                      and not _is_comment_offset(block, match.start())), None)
+        if begin is None:
+            continue
+        cursor = begin.end()
+        if cursor < len(block) and block[cursor] == "[":
+            _, cursor = _read_tex_group(block, cursor, "[", "]")
+        width, _ = _read_tex_group(block, cursor, "{", "}")
+        match = re.fullmatch(
+            r"\s*(?:(\d+(?:\.\d+)?)\s*)?\\(?:textwidth|linewidth|columnwidth)\s*",
+            width or "",
+        )
+        blocks.append({
+            "block": block,
+            "ratio": float(match.group(1) or 1) if match else None,
+        })
+    return blocks
+
+
+def _preserve_wide_subfigure_tables(source_text, output_path):
+    """Keep wide LaTeX subfigures stacked and their nested tables readable."""
+    document = Document(output_path)
+    figure_tables = [table._tbl for table in document.tables
+                     if (style := table._tbl.find(
+                         qn("w:tblPr")).find(qn("w:tblStyle"))) is not None
+                     and style.get(qn("w:val")) == "FigureTable"]
+    source_figures = [record for record in _figure_caption_records(source_text)
+                      if _subfigure_blocks(record)]
+    if not figure_tables or not source_figures:
+        return
+
+    section = document.sections[0]
+    text_width = (section.page_width - section.left_margin - section.right_margin) / 914400
+    changed = False
+    for record, table_element in zip(source_figures, figure_tables):
+        subfigures = _subfigure_blocks(record)
+        rows = table_element.findall(qn("w:tr"))
+        if (len(subfigures) < 2
+                or any(item["ratio"] is None or item["ratio"] < 0.7
+                       for item in subfigures)
+                or len(rows) != 1):
+            continue
+        cells = rows[0].findall(qn("w:tc"))
+        if len(cells) != len(subfigures):
+            continue
+
+        grid = table_element.find(qn("w:tblGrid"))
+        if grid is None:
+            continue
+        for column in list(grid):
+            grid.remove(column)
+        column = OxmlElement("w:gridCol")
+        column.set(qn("w:w"), str(round(text_width * 1440)))
+        grid.append(column)
+        table_element.remove(rows[0])
+        for cell in cells:
+            row = OxmlElement("w:tr")
+            row.append(deepcopy(cell))
+            table_element.append(row)
+        _set_table_column_widths(table_element, [text_width])
+        changed = True
+
+        for subfigure, row in zip(subfigures, table_element.findall(qn("w:tr"))):
+            cell = row.find(qn("w:tc"))
+            nested_tables = list(cell.iter(qn("w:tbl")))
+            used = set()
+            local_width = text_width * subfigure["ratio"]
+            for table_width, column_spec in _table_column_specs(
+                    {"float": subfigure["block"]}):
+                if table_width is None:
+                    continue
+                widths = _column_widths_inches(
+                    table_width, column_spec, local_width)
+                if not widths:
+                    continue
+                target = next((item for item in nested_tables
+                               if id(item) not in used
+                               and len(item.findall(
+                                   f"{qn('w:tblGrid')}/{qn('w:gridCol')}")) == len(widths)),
+                              None)
+                if target is None:
+                    continue
+                used.add(id(target))
+                changed = _set_table_column_widths(target, widths) or changed
+
+    if changed:
+        document.save(output_path)
 
 
 def _plain_caption_text(caption):
@@ -784,6 +1266,105 @@ def _restore_figure_caption_labels(source_text, output_path):
     changed = False
     for record, paragraph in matches:
         changed = _prepend_caption_label(paragraph, record["prefix"]) or changed
+    if changed:
+        document.save(output_path)
+
+
+def _restore_appendix_headings(document, source_text):
+    records, _ = _appendix_heading_records(source_text)
+    if not records:
+        return False
+
+    headings = [paragraph for paragraph in document.paragraphs
+                if paragraph.style.name in ("Heading 1", "Heading 2", "Heading 3")]
+    next_heading = 0
+    changed = False
+    for record in records:
+        expected = _normalized_text(_plain_caption_text(record["title"]))
+        if not expected:
+            continue
+        style_name = f"Heading {record['level']}"
+        candidates = [
+            (SequenceMatcher(
+                None, expected, _normalized_text(paragraph.text)).ratio(),
+             index, paragraph)
+            for index, paragraph in enumerate(headings[next_heading:], next_heading)
+            if paragraph.style.name == style_name
+        ]
+        if not candidates:
+            continue
+        similarity, index, paragraph = max(candidates, key=lambda item: item[0])
+        if similarity < 0.45:
+            continue
+        next_heading = index + 1
+        prefix = record["prefix"]
+        if not prefix:
+            continue
+        for run_index, run in enumerate(paragraph.runs):
+            if not re.fullmatch(r"\d+(?:\.\d+)*", run.text.strip()):
+                continue
+            if run.text != prefix:
+                run.text = prefix
+                changed = True
+            for following in paragraph.runs[run_index + 1:]:
+                if following.text == "\t":
+                    following.text = " "
+                    changed = True
+                    break
+                if following.text.strip():
+                    break
+            break
+    return changed
+
+
+def _hyperlink_text(hyperlink):
+    return "".join(node.text or "" for node in hyperlink.iter(qn("w:t")))
+
+
+def _set_hyperlink_text(hyperlink, text):
+    nodes = list(hyperlink.iter(qn("w:t")))
+    if not nodes:
+        return False
+    if _hyperlink_text(hyperlink) == text:
+        return False
+    nodes[0].text = text
+    for node in nodes[1:]:
+        node.text = ""
+    return True
+
+
+def _restore_cross_reference_numbers(source_text, output_path):
+    """Correct Pandoc reference numbers for floats and LaTeX appendix labels."""
+    document = Document(output_path)
+    hyperlinks = list(document.element.iter(qn("w:hyperlink")))
+    if not hyperlinks:
+        return
+
+    resolved = {}
+    for hyperlink in hyperlinks:
+        anchor = hyperlink.get(qn("w:anchor"))
+        value = _hyperlink_text(hyperlink)
+        if anchor and value and not re.fullmatch(r"\[[^\]]+\]", value):
+            resolved.setdefault(anchor, value)
+
+    _, appendix_numbers = _appendix_heading_records(source_text)
+    label_numbers = dict(appendix_numbers)
+    label_numbers.update(_figure_reference_numbers(source_text))
+    label_numbers.update(_table_reference_numbers(source_text))
+    for alias, target in _section_label_aliases(source_text).items():
+        if alias in label_numbers:
+            continue
+        value = label_numbers.get(target, resolved.get(target))
+        if value and not re.fullmatch(r"\[[^\]]+\]", value):
+            label_numbers[alias] = value
+
+    changed = False
+    for hyperlink in hyperlinks:
+        anchor = hyperlink.get(qn("w:anchor"))
+        value = label_numbers.get(anchor)
+        if value is not None:
+            changed = _set_hyperlink_text(hyperlink, value) or changed
+    changed = _restore_appendix_headings(document, source_text) or changed
     if changed:
         document.save(output_path)
 
@@ -997,6 +1578,7 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None):
         table_records = _table_float_records(source_text)
         cleaned_source = _normalize_table_captions(source_text)
         cleaned_source = _normalize_minipage_tables(cleaned_source)
+        cleaned_source = _normalize_subfigure_tabularx(cleaned_source)
         cleaned_source = _normalize_includegraphics_options(cleaned_source)
     with tempfile.TemporaryDirectory(prefix="pdf2docx-latex-") as temp_dir:
         temp_source_path = os.path.join(temp_dir, os.path.basename(source_path))
@@ -1022,5 +1604,8 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None):
             source_text, table_records, destination_path, source_dir,
             reference_docx_path, temp_dir)
         _restore_figure_caption_labels(source_text, destination_path)
+        _restore_cross_reference_numbers(source_text, destination_path)
+        _preserve_latex_table_widths(source_text, destination_path)
+        _preserve_wide_subfigure_tables(source_text, destination_path)
         _preserve_wide_subfigure_image_widths(source_text, destination_path)
     return destination_path
