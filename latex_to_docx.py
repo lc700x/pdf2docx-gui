@@ -5,9 +5,11 @@ import re
 import subprocess
 import tempfile
 from copy import deepcopy
+from difflib import SequenceMatcher
 
 import pypandoc
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -119,17 +121,35 @@ def _layout_from_source(source_text):
     return page_size, margins
 
 
-def _set_style_font(style, size, bold=None):
+def _set_style_font(style, size, bold=None, italic=None):
     style.font.name = "Times New Roman"
     style.font.size = Pt(size)
     if bold is not None:
         style.font.bold = bold
+    if italic is not None:
+        style.font.italic = italic
     style._element.get_or_add_rPr().get_or_add_rFonts().set(
         qn("w:eastAsia"), "Times New Roman")
 
 
 def _style_by_name(document, name):
     return next(style for style in document.styles if style.name == name)
+
+
+def _ensure_table_caption_style(document):
+    try:
+        return _style_by_name(document, "Table Caption")
+    except StopIteration:
+        style = document.styles.add_style("Table Caption", WD_STYLE_TYPE.PARAGRAPH)
+        try:
+            style.base_style = _style_by_name(document, "Caption")
+        except StopIteration:
+            style.base_style = _style_by_name(document, "Normal")
+        _set_style_font(style, 10, italic=False)
+        style.paragraph_format.line_spacing = 1
+        style.paragraph_format.space_after = Pt(8)
+        style.paragraph_format.keep_with_next = True
+        return style
 
 
 def _create_reference_docx(source_text, destination_path):
@@ -155,7 +175,37 @@ def _create_reference_docx(source_text, destination_path):
 
     normal = _style_by_name(document, "Normal")
     _set_style_font(normal, 12)
-    normal.paragraph_format.line_spacing = 1.5
+    normal.paragraph_format.line_spacing = None
+
+    for name in ("Body Text", "First Paragraph", "Bibliography", "Abstract"):
+        try:
+            style = _style_by_name(document, name)
+        except StopIteration:
+            continue
+        _set_style_font(style, 12)
+        style.paragraph_format.line_spacing = 1.5
+        style.paragraph_format.space_before = None
+        style.paragraph_format.space_after = Pt(6)
+    try:
+        _style_by_name(document, "Abstract").paragraph_format.keep_with_next = True
+    except StopIteration:
+        pass
+    try:
+        abstract_title = _style_by_name(document, "Abstract Title")
+        _set_style_font(abstract_title, 12, bold=True)
+        abstract_title.paragraph_format.space_before = Pt(15)
+        abstract_title.paragraph_format.space_after = None
+        abstract_title.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        abstract_title.paragraph_format.keep_with_next = True
+    except StopIteration:
+        pass
+    try:
+        compact = _style_by_name(document, "Compact")
+        _set_style_font(compact, 12)
+        compact.paragraph_format.space_before = Pt(1.8)
+        compact.paragraph_format.space_after = Pt(1.8)
+    except StopIteration:
+        pass
 
     title = _style_by_name(document, "Title")
     _set_style_font(title, 17, bold=True)
@@ -163,11 +213,19 @@ def _create_reference_docx(source_text, destination_path):
     title.paragraph_format.line_spacing = 1
     for name, size in (("Heading 1", 14), ("Heading 2", 12), ("Heading 3", 12)):
         heading = _style_by_name(document, name)
-        _set_style_font(heading, size, bold=True)
+        _set_style_font(heading, size, bold=True, italic=False)
+        heading.paragraph_format.space_before = Pt(12)
         heading.paragraph_format.space_after = Pt(6)
-    caption = _style_by_name(document, "Caption")
-    _set_style_font(caption, 10)
-    caption.paragraph_format.line_spacing = 1
+    for name in ("Table Caption", "Image Caption"):
+        try:
+            caption = _style_by_name(document, name)
+        except StopIteration:
+            caption = document.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+        _set_style_font(caption, 10, italic=False)
+        caption.paragraph_format.line_spacing = 1
+        caption.paragraph_format.space_before = None
+        caption.paragraph_format.space_after = Pt(8)
+    _style_by_name(document, "Table Caption").paragraph_format.keep_with_next = True
 
     for name in ("Author", "Date"):
         try:
@@ -368,6 +426,59 @@ def _table_float_ranges(text):
     return ranges
 
 
+def _named_environment_ranges(text, names):
+    ranges = []
+    stack = []
+    for match in _ENVIRONMENT_PATTERN.finditer(text):
+        if _is_comment_offset(text, match.start()):
+            continue
+        operation, environment = match.groups()
+        if operation == "begin":
+            start = match.start() if environment in names and not any(
+                item[0] in names and item[1] is not None for item in stack) else None
+            stack.append((environment, start))
+        elif stack:
+            matching = next((index for index in range(len(stack) - 1, -1, -1)
+                             if stack[index][0] == environment), None)
+            if matching is None:
+                continue
+            open_environment, start = stack[matching]
+            del stack[matching:]
+            if open_environment in names and start is not None:
+                ranges.append((start, match.end()))
+    return ranges
+
+
+def _figure_caption_records(text):
+    """Return numbered figure captions whose labels Word/Pandoc omits."""
+    records = []
+    figure_number = 0
+    for start, end in _named_environment_ranges(text, {"figure", "figure*"}):
+        block = text[start:end]
+        subfigures = _named_environment_ranges(block, {"subfigure"})
+        captions = [match for match in _CAPTION_PATTERN.finditer(block)
+                    if not _is_comment_offset(block, match.start())]
+        top_level = [match for match in captions
+                     if not match.group(1)
+                     and not any(left < match.start() < right
+                                 for left, right in subfigures)]
+        for match in top_level:
+            figure_number += 1
+            cursor = match.end()
+            while cursor < len(block) and block[cursor].isspace():
+                cursor += 1
+            if cursor < len(block) and block[cursor] == "[":
+                _, cursor = _read_tex_group(block, cursor, "[", "]")
+            caption, _ = _read_tex_group(block, cursor, "{", "}")
+            if caption is None:
+                continue
+            records.append({
+                "caption": caption,
+                "prefix": f"Figure {figure_number}.",
+            })
+    return records
+
+
 def _table_float_records(text):
     """Return numbered table floats and their caption source text."""
     records = []
@@ -534,37 +645,53 @@ def _normalize_minipage_tables(text):
     return text
 
 
-def _standalone_table_source(record, source_text):
-    """Build a small LaTeX file for a table the main reader omitted."""
+def _standalone_table_sources(record, source_text):
+    """Build standalone sources for each native table in a LaTeX float."""
     block = record["float"]
-    match = re.search(r"\\begin\s*\{(tabularx|tabular)\}", block)
-    if not match or _is_comment_offset(block, match.start()):
-        return None
-
-    environment = match.group(1)
-    cursor = match.end()
-    if environment == "tabularx":
-        _, cursor = _read_tex_group(block, cursor, "{", "}")
-    column_spec, cursor = _read_tex_group(block, cursor, "{", "}")
-    if column_spec is None:
-        return None
-    end_match = re.search(
-        rf"\\end\s*\{{{environment}\}}", block[cursor:])
-    if not end_match:
-        return None
-
-    body_end = cursor + end_match.start()
-    table = ("\\begin{tabular}{" + _simplify_column_spec(column_spec) + "}"
-             + block[cursor:body_end] + "\\end{tabular}")
     document_start = re.search(r"\\begin\s*\{document\}", source_text)
     if not document_start:
-        return None
+        return []
     preamble = source_text[:document_start.start()]
     caption = record["caption"]
     if not record["starred"]:
         caption = f"\\textbf{{Table {record['number']}.}} " + caption
-    return (preamble + "\n\\begin{document}\n" + caption + "\n\n"
+    environments = [
+        match for match in _ENVIRONMENT_PATTERN.finditer(block)
+        if not _is_comment_offset(block, match.start())
+    ]
+    sources = []
+    consumed_until = -1
+    for index, match in enumerate(environments):
+        environment = match.group(2)
+        if (match.start() < consumed_until or match.group(1) != "begin"
+                or environment not in ("tabularx", "tabular")):
+            continue
+        cursor = match.end()
+        if environment == "tabularx":
+            _, cursor = _read_tex_group(block, cursor, "{", "}")
+        column_spec, cursor = _read_tex_group(block, cursor, "{", "}")
+        if column_spec is None:
+            continue
+
+        depth = 1
+        end_match = None
+        for item in environments[index + 1:]:
+            if item.start() < cursor or item.group(2) != environment:
+                continue
+            depth += 1 if item.group(1) == "begin" else -1
+            if not depth:
+                end_match = item
+                break
+        if end_match is None:
+            continue
+
+        table = ("\\begin{tabular}{" + _simplify_column_spec(column_spec) + "}"
+                 + block[cursor:end_match.start()] + "\\end{tabular}")
+        sources.append(
+            preamble + "\n\\begin{document}\n" + caption + "\n\n"
             + table + "\n\\end{document}\n")
+        consumed_until = end_match.end()
+    return sources
 
 
 def _plain_caption_text(caption):
@@ -580,19 +707,110 @@ def _normalized_text(text):
     return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
 
 
-def _table_content_coverage(candidate_table, document):
-    cells = [
+def _prepend_caption_label(paragraph, label):
+    """Insert a bold figure label without flattening existing caption runs."""
+    if re.match(r"^\s*Figure\s+\d+\.", paragraph.text, re.I):
+        return False
+
+    for run in paragraph.runs:
+        if not run.text:
+            continue
+        trimmed = run.text.lstrip()
+        if trimmed:
+            if trimmed != run.text:
+                run.text = trimmed
+            break
+        run._element.getparent().remove(run._element)
+
+    runs = []
+    label_run = OxmlElement("w:r")
+    properties = OxmlElement("w:rPr")
+    properties.append(OxmlElement("w:b"))
+    label_run.append(properties)
+    label_text = OxmlElement("w:t")
+    label_text.text = label
+    label_run.append(label_text)
+    runs.append(label_run)
+
+    space_run = OxmlElement("w:r")
+    space_text = OxmlElement("w:t")
+    space_text.set(qn("xml:space"), "preserve")
+    space_text.text = " "
+    space_run.append(space_text)
+    runs.append(space_run)
+
+    first_content_index = 1 if paragraph._p.pPr is not None else 0
+    for offset, run in enumerate(runs):
+        paragraph._p.insert(first_content_index + offset, run)
+    return True
+
+
+def _restore_figure_caption_labels(source_text, output_path):
+    """Restore numbered figure labels while retaining Pandoc's caption text."""
+    records = _figure_caption_records(source_text)
+    if not records:
+        return
+
+    document = Document(output_path)
+    paragraphs = [paragraph for paragraph in document.paragraphs
+                  if paragraph.style.name == "Image Caption"]
+    if not paragraphs:
+        return
+
+    if len(records) == len(paragraphs):
+        matches = list(zip(records, paragraphs))
+    else:
+        matches = []
+        next_paragraph = 0
+        for record in records:
+            expected = _normalized_text(_plain_caption_text(record["caption"]))
+            if not expected:
+                continue
+            candidates = [
+                (SequenceMatcher(
+                    None, expected, _normalized_text(paragraph.text)).ratio(),
+                 index, paragraph)
+                for index, paragraph in enumerate(
+                    paragraphs[next_paragraph:], next_paragraph)
+            ]
+            if not candidates:
+                break
+            similarity, index, paragraph = max(candidates, key=lambda item: item[0])
+            if similarity < 0.45:
+                continue
+            matches.append((record, paragraph))
+            next_paragraph = index + 1
+
+    changed = False
+    for record, paragraph in matches:
+        changed = _prepend_caption_label(paragraph, record["prefix"]) or changed
+    if changed:
+        document.save(output_path)
+
+
+def _table_cells(table):
+    return {
         _normalized_text(cell.text)
-        for row in candidate_table.rows for cell in row.cells
-    ]
-    cells = [cell for cell in cells if len(cell) >= 4]
-    if not cells:
-        return 1.0
-    content = " ".join(
-        [_normalized_text(paragraph.text) for paragraph in document.paragraphs]
-        + [_normalized_text(cell.text) for table in document.tables
-           for row in table.rows for cell in row.cells])
-    return sum(cell in content for cell in cells) / len(cells)
+        for row in table.rows for cell in row.cells
+        if len(_normalized_text(cell.text)) >= 4
+    }
+
+
+def _table_matches(candidate, existing):
+    if (len(candidate.rows), len(candidate.columns)) != (
+            len(existing.rows), len(existing.columns)):
+        return False
+    if existing._tbl.findall(".//" + qn("w:drawing")):
+        return False
+    candidate_cells = _table_cells(candidate)
+    existing_cells = _table_cells(existing)
+    if not candidate_cells or not existing_cells:
+        return False
+    shared = len(candidate_cells & existing_cells)
+    # ponytail: overlap tolerates merged-cell differences; source-position mapping
+    # would be needed if Pandoc starts changing table dimensions between passes.
+    return (shared / len(candidate_cells) >= 0.35
+            and shared / len(existing_cells) >= 0.55)
 
 
 def _insert_caption_and_table(document, number, caption_text, table_element=None):
@@ -614,14 +832,25 @@ def _insert_caption_and_table(document, number, caption_text, table_element=None
 
     paragraph_element = OxmlElement("w:p")
     paragraph = Paragraph(paragraph_element, document._body)
-    paragraph.style = _style_by_name(document, "Caption")
+    paragraph.style = _ensure_table_caption_style(document)
     label = paragraph.add_run(f"Table {number}.")
     label.bold = True
     if caption_text:
         paragraph.add_run(" " + caption_text)
     body.insert(index, paragraph_element)
+    inserted_table = None
     if table_element is not None:
-        body.insert(index + 1, deepcopy(table_element))
+        inserted_table = deepcopy(table_element)
+        body.insert(index + 1, inserted_table)
+    return paragraph_element, inserted_table
+
+
+def _insert_table_after_element(document, anchor, table_element):
+    body = document.element.body
+    index = list(body).index(anchor) + 1
+    inserted = deepcopy(table_element)
+    body.insert(index, inserted)
+    return inserted
 
 
 def _restore_table_captions_and_missing_tables(
@@ -630,6 +859,7 @@ def _restore_table_captions_and_missing_tables(
     """Restore captions and recover native tables Pandoc silently skipped."""
     document = Document(output_path)
     changed = False
+    table_caption_style = _ensure_table_caption_style(document)
     for record in records:
         if record["starred"]:
             continue
@@ -638,9 +868,9 @@ def _restore_table_captions_and_missing_tables(
         matching = next((paragraph for paragraph in document.paragraphs
                          if paragraph.text.strip().startswith(marker)), None)
         if matching is not None:
-            if matching.style.name != "Caption":
+            if matching.style.name != "Table Caption":
                 changed = True
-            matching.style = _style_by_name(document, "Caption")
+            matching.style = table_caption_style
             if not matching.text[len(marker):].strip():
                 caption_text = _plain_caption_text(record["caption"])
                 for run in list(matching.runs):
@@ -650,13 +880,14 @@ def _restore_table_captions_and_missing_tables(
                 if caption_text:
                     matching.add_run(" " + caption_text)
                 changed = True
-            continue
 
-        table_element = None
-        table_source = _standalone_table_source(record, source_text)
-        if table_source:
-            candidate_source = os.path.join(temp_dir, f"fallback-table-{number}.tex")
-            candidate_docx = os.path.join(temp_dir, f"fallback-table-{number}.docx")
+        missing_tables = []
+        for table_index, table_source in enumerate(
+                _standalone_table_sources(record, source_text), start=1):
+            candidate_source = os.path.join(
+                temp_dir, f"fallback-table-{number}-{table_index}.tex")
+            candidate_docx = os.path.join(
+                temp_dir, f"fallback-table-{number}-{table_index}.docx")
             with open(candidate_source, "w", encoding="utf-8", newline="") as source_file:
                 source_file.write(table_source)
             pypandoc.convert_file(
@@ -676,12 +907,27 @@ def _restore_table_captions_and_missing_tables(
                 table = max(
                     candidate.tables,
                     key=lambda item: len(item.rows) * len(item.columns))
-                if _table_content_coverage(table, document) < 0.75:
-                    table_element = table._tbl
+                if not any(_table_matches(table, existing)
+                           for existing in document.tables):
+                    missing_tables.append(table._tbl)
 
-        caption_text = _plain_caption_text(record["caption"])
-        _insert_caption_and_table(document, number, caption_text, table_element)
-        changed = True
+        if matching is None:
+            caption_text = _plain_caption_text(record["caption"])
+            paragraph_element, anchor = _insert_caption_and_table(
+                document, number, caption_text,
+                missing_tables.pop(0) if missing_tables else None)
+            if anchor is None:
+                anchor = paragraph_element
+            for table_element in missing_tables:
+                anchor = _insert_table_after_element(
+                    document, anchor, table_element)
+            changed = True
+        elif missing_tables:
+            anchor = matching._p
+            for table_element in missing_tables:
+                anchor = _insert_table_after_element(
+                    document, anchor, table_element)
+            changed = True
 
     if changed:
         document.save(output_path)
@@ -775,5 +1021,6 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None):
         _restore_table_captions_and_missing_tables(
             source_text, table_records, destination_path, source_dir,
             reference_docx_path, temp_dir)
+        _restore_figure_caption_labels(source_text, destination_path)
         _preserve_wide_subfigure_image_widths(source_text, destination_path)
     return destination_path

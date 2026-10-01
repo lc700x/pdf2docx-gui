@@ -8,7 +8,10 @@ import zlib
 from docx import Document
 
 from latex_to_docx import (
+    _create_reference_docx,
     _normalize_minipage_tables,
+    _restore_table_captions_and_missing_tables,
+    _table_float_records,
     _wide_subfigure_linewidth_images,
     convert_latex_to_docx,
 )
@@ -69,6 +72,56 @@ alpha \\
         self.assertIn(r"\begin{tabular}{l}", normalized)
         self.assertNotIn(r"\begin{minipage}", normalized)
         self.assertNotIn(r"\begin{tabularx}", normalized)
+
+    def test_recovers_native_table_when_pandoc_kept_only_its_caption(self):
+        source = r"""\documentclass{article}
+\begin{document}
+\begin{table}
+\caption{Unique table content}
+\begin{tabular}{ll}
+Header Alpha & Header Beta \\
+Rare Zebra Marker & 42 \\
+\end{tabular}
+\begin{tabular}{ll}
+Second Header Alpha & Second Header Beta \\
+Rare Otter Marker & 17 \\
+\end{tabular}
+\end{table}
+\end{document}"""
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = os.path.join(directory, "main.tex")
+            reference_path = os.path.join(directory, "reference.docx")
+            output_path = os.path.join(directory, "output.docx")
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                source_file.write(source)
+            _create_reference_docx(source, reference_path)
+
+            document = Document()
+            caption = document.add_paragraph("Table 1. Unique table content")
+            caption.style = "Caption"
+            unrelated = document.add_table(rows=2, cols=2)
+            unrelated.cell(0, 0).text = "Other heading"
+            unrelated.cell(0, 1).text = "Different heading"
+            unrelated.cell(1, 0).text = "Unrelated value"
+            unrelated.cell(1, 1).text = "Another value"
+            document.save(output_path)
+
+            _restore_table_captions_and_missing_tables(
+                source, _table_float_records(source), output_path, directory,
+                reference_path, directory)
+
+            converted = Document(output_path)
+            self.assertEqual(len(converted.tables), 3)
+            self.assertEqual(
+                sum(p.text.startswith("Table 1.") for p in converted.paragraphs), 1)
+            self.assertTrue(any(
+                "Rare Zebra Marker" in cell.text
+                for table in converted.tables
+                for row in table.rows for cell in row.cells))
+            self.assertTrue(any(
+                "Rare Otter Marker" in cell.text
+                for table in converted.tables
+                for row in table.rows for cell in row.cells))
 
     def test_conversion_keeps_text_tables_math_figures_and_citations(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +198,20 @@ width=0.5\textwidth
             self.assertIn("Pixel plot", document_text)
             self.assertIn("Wide pixel plot", document_text)
             self.assertIn("Table 1. Numeric results", document_text)
+            figure_captions = [
+                paragraph for paragraph in document.paragraphs
+                if paragraph.style.name == "Image Caption"]
+            self.assertTrue(any(
+                paragraph.text == "Figure 1. Pixel plot"
+                for paragraph in figure_captions))
+            self.assertTrue(any(
+                paragraph.runs and paragraph.runs[0].text == "Figure 1."
+                and paragraph.runs[0].bold
+                for paragraph in figure_captions))
+            table_caption = next(
+                paragraph for paragraph in document.paragraphs
+                if paragraph.text.startswith("Table 1."))
+            self.assertEqual(table_caption.style.name, "Table Caption")
             heading = next(
                 paragraph for paragraph in document.paragraphs
                 if paragraph.text.endswith("Editable section"))
@@ -172,6 +239,11 @@ width=0.5\textwidth
                 document.sections[0].left_margin / 914400, 1.0, places=2)
             self.assertEqual(document.styles["Normal"].font.name, "Times New Roman")
             self.assertEqual(document.styles["Normal"].font.size.pt, 12)
+            self.assertEqual(
+                document.styles["Image Caption"].font.size.pt, 10)
+            self.assertEqual(
+                document.styles["Heading 1"].paragraph_format.space_before.pt,
+                12)
             with zipfile.ZipFile(destination_path) as archive:
                 xml = archive.read("word/document.xml").decode("utf-8")
                 self.assertIn("<m:oMath", xml)
