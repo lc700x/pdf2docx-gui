@@ -16,6 +16,11 @@ def _vocab_beside(src):
     return [p for p in (stem + '.tex', stem + '.bbl') if os.path.exists(p)]
 
 
+def _queue_error_dialog(root, messagebox, error):
+    message = str(error)
+    root.after(0, lambda: messagebox.showerror("Error", message))
+
+
 def build_app():
     # Imported here, not at module level: --cli runs on installs without Tk.
     import tkinter as tk
@@ -105,7 +110,7 @@ def build_app():
             status.set(note)
         except Exception as exc:
             status.set("Failed.")
-            root.after(0, lambda: messagebox.showerror("Error", str(exc)))
+            _queue_error_dialog(root, messagebox, exc)
         finally:
             bar.stop()
             btn_convert.config(state=tk.NORMAL)
