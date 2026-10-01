@@ -21,6 +21,11 @@ def _queue_error_dialog(root, messagebox, error):
     root.after(0, lambda: messagebox.showerror("Error", message))
 
 
+def _polish_summary(counts):
+    return (f" Restored {counts['spaces']} spaces,"
+            f" removed {counts['page breaks dropped']} page breaks.")
+
+
 def build_app():
     # Imported here, not at module level: --cli runs on installs without Tk.
     import tkinter as tk
@@ -105,8 +110,7 @@ def build_app():
             if var_polish.get():
                 status.set("Tidying the document…")
                 counts = polish_module.polish(dst, src, _vocab_beside(src))
-                note += (f" Restored {counts['spaces']} spaces,"
-                         f" removed {counts['page breaks']} page breaks.")
+                note += _polish_summary(counts)
             status.set(note)
         except Exception as exc:
             status.set("Failed.")
