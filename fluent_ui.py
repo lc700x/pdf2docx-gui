@@ -13,10 +13,10 @@ from qfluentwidgets import (
     CaptionLabel,
     CardWidget,
     CheckBox,
+    IndeterminateProgressBar,
     LineEdit,
     MessageBox,
     PrimaryPushButton,
-    ProgressBar,
     PushButton,
     SubtitleLabel,
     Theme,
@@ -209,8 +209,7 @@ class ConverterWindow(QWidget):
         footer.addWidget(self.convert_button)
         layout.addLayout(footer)
 
-        self.progress = ProgressBar(self)
-        self.progress.setRange(0, 0)
+        self.progress = IndeterminateProgressBar(self, start=False)
         self.progress.hide()
         layout.addWidget(self.progress)
 
@@ -303,6 +302,10 @@ class ConverterWindow(QWidget):
         self.images_option.setEnabled(not busy)
         self.tidy_option.setEnabled(not busy)
         self.convert_button.setEnabled(not busy and self.input_path is not None)
+        if busy:
+            self.progress.start()
+        else:
+            self.progress.stop()
         self.progress.setVisible(busy)
 
     def _conversion_succeeded(self, result):

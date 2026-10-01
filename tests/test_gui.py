@@ -28,6 +28,25 @@ class FluentUiTests(unittest.TestCase):
         self.assertTrue(window.tidy_option.isChecked())
         self.assertFalse(window.convert_button.isEnabled())
 
+    def test_progress_bar_animates_only_while_conversion_is_busy(self):
+        window = ConverterWindow(lambda *args, **kwargs: {})
+        self.addCleanup(window.close)
+
+        self.assertFalse(window.progress.isStarted())
+        window._set_busy(True)
+        self.assertFalse(window.progress.isHidden())
+        self.assertTrue(window.progress.isStarted())
+        start_position = window.progress.shortPos
+
+        loop = QEventLoop()
+        QTimer.singleShot(250, loop.quit)
+        loop.exec()
+        self.assertNotEqual(window.progress.shortPos, start_position)
+
+        window._set_busy(False)
+        self.assertTrue(window.progress.isHidden())
+        self.assertFalse(window.progress.isStarted())
+
     def test_success_message_reports_the_correct_page_break_count(self):
         self.assertEqual(
             _success_message({
