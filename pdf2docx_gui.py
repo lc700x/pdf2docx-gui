@@ -43,7 +43,7 @@ def build_app():
     from fluent_ui import ConverterWindow
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
-    app.setApplicationName("PDF to DOCX Converter")
+    app.setApplicationName("PDF and LaTeX to Word Converter")
     return app, ConverterWindow(_convert_document)
 
 

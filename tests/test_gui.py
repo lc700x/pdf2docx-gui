@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 from fluent_ui import (
     ConversionWorker,
     ConverterWindow,
-    PdfDropZone,
+    FileDropZone,
     _success_message,
 )
 
@@ -23,29 +23,42 @@ class FluentUiTests(unittest.TestCase):
     def test_conversion_options_default_to_enabled_and_wait_for_pdf(self):
         window = ConverterWindow(lambda *args, **kwargs: {})
         self.addCleanup(window.close)
+        page = window.pdf_page
 
-        self.assertTrue(window.images_option.isChecked())
-        self.assertTrue(window.tidy_option.isChecked())
-        self.assertFalse(window.convert_button.isEnabled())
+        self.assertEqual(window.stackedWidget.count(), 2)
+        self.assertTrue(page.images_option.isChecked())
+        self.assertTrue(page.tidy_option.isChecked())
+        self.assertFalse(page.convert_button.isEnabled())
+
+    def test_tex_selection_sets_safe_default_output_and_rejects_other_files(self):
+        window = ConverterWindow(lambda *args, **kwargs: {})
+        self.addCleanup(window.close)
+        page = window.tex_page
+
+        self.assertFalse(page.set_input("paper.pdf"))
+        self.assertTrue(page.set_input("/tmp/paper.tex"))
+        self.assertEqual(page.output_edit.text(), "/tmp/paper_from_tex.docx")
+        self.assertTrue(page.convert_button.isEnabled())
 
     def test_progress_bar_animates_only_while_conversion_is_busy(self):
         window = ConverterWindow(lambda *args, **kwargs: {})
         self.addCleanup(window.close)
+        page = window.pdf_page
 
-        self.assertFalse(window.progress.isStarted())
-        window._set_busy(True)
-        self.assertFalse(window.progress.isHidden())
-        self.assertTrue(window.progress.isStarted())
-        start_position = window.progress.shortPos
+        self.assertFalse(page.progress.isStarted())
+        page._set_busy(True)
+        self.assertFalse(page.progress.isHidden())
+        self.assertTrue(page.progress.isStarted())
+        start_position = page.progress.shortPos
 
         loop = QEventLoop()
         QTimer.singleShot(250, loop.quit)
         loop.exec()
-        self.assertNotEqual(window.progress.shortPos, start_position)
+        self.assertNotEqual(page.progress.shortPos, start_position)
 
-        window._set_busy(False)
-        self.assertTrue(window.progress.isHidden())
-        self.assertFalse(window.progress.isStarted())
+        page._set_busy(False)
+        self.assertTrue(page.progress.isHidden())
+        self.assertFalse(page.progress.isStarted())
 
     def test_success_message_reports_the_correct_page_break_count(self):
         self.assertEqual(
@@ -59,17 +72,18 @@ class FluentUiTests(unittest.TestCase):
     def test_pdf_selection_sets_default_output_and_rejects_other_files(self):
         window = ConverterWindow(lambda *args, **kwargs: {})
         self.addCleanup(window.close)
+        page = window.pdf_page
 
-        self.assertFalse(window.set_input("paper.docx"))
+        self.assertFalse(page.set_input("paper.docx"))
         self.assertTrue(window.set_input("/tmp/paper.pdf"))
-        self.assertEqual(window.output_edit.text(), "/tmp/paper.docx")
-        self.assertTrue(window.convert_button.isEnabled())
+        self.assertEqual(page.output_edit.text(), "/tmp/paper.docx")
+        self.assertTrue(page.convert_button.isEnabled())
 
-        window.output_edit.setText("/tmp/custom.docx")
-        self.assertEqual(window.output_edit.text(), "/tmp/custom.docx")
+        page.output_edit.setText("/tmp/custom.docx")
+        self.assertEqual(page.output_edit.text(), "/tmp/custom.docx")
 
     def test_drop_accepts_pdf_and_uses_the_first_pdf_url(self):
-        zone = PdfDropZone()
+        zone = FileDropZone("PDF", "pdf")
         self.addCleanup(zone.close)
         mime_data = QMimeData()
         mime_data.setUrls([
@@ -77,7 +91,7 @@ class FluentUiTests(unittest.TestCase):
             QUrl.fromLocalFile("/tmp/paper.PDF"),
         ])
         dropped = []
-        zone.pdfDropped.connect(dropped.append)
+        zone.fileDropped.connect(dropped.append)
 
         drag = QDragEnterEvent(
             QPoint(5, 5), Qt.CopyAction, mime_data,
@@ -91,6 +105,25 @@ class FluentUiTests(unittest.TestCase):
         zone.dropEvent(drop)
         self.assertTrue(drop.isAccepted())
         self.assertEqual(dropped, ["/tmp/paper.PDF"])
+
+    def test_drop_accepts_tex_and_uses_the_first_tex_url(self):
+        zone = FileDropZone("TeX source", "tex")
+        self.addCleanup(zone.close)
+        mime_data = QMimeData()
+        mime_data.setUrls([
+            QUrl.fromLocalFile("/tmp/readme.txt"),
+            QUrl.fromLocalFile("/tmp/paper.TeX"),
+        ])
+        dropped = []
+        zone.fileDropped.connect(dropped.append)
+
+        drop = QDropEvent(
+            QPointF(5, 5), Qt.CopyAction, mime_data,
+            Qt.LeftButton, Qt.NoModifier)
+        zone.dropEvent(drop)
+
+        self.assertTrue(drop.isAccepted())
+        self.assertEqual(dropped, ["/tmp/paper.TeX"])
 
     def test_worker_emits_status_and_success(self):
         results = []
@@ -133,20 +166,21 @@ class FluentUiTests(unittest.TestCase):
 
         window = ConverterWindow(convert)
         self.addCleanup(window.close)
+        page = window.pdf_page
         window.set_input("/tmp/paper.pdf")
         loop = QEventLoop()
         poll = QTimer()
-        poll.timeout.connect(lambda: loop.quit() if window._thread is None else None)
+        poll.timeout.connect(lambda: loop.quit() if page._thread is None else None)
 
-        window.start_conversion()
+        page.start_conversion()
         poll.start(10)
         QTimer.singleShot(3000, loop.quit)
         loop.exec()
         poll.stop()
 
-        self.assertIsNone(window._thread)
-        self.assertEqual(window.status_label.text(), "Done.")
-        self.assertTrue(window.convert_button.isEnabled())
+        self.assertIsNone(page._thread)
+        self.assertEqual(page.status_label.text(), "Done.")
+        self.assertTrue(page.convert_button.isEnabled())
 
 
 if __name__ == "__main__":

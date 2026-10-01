@@ -7,7 +7,7 @@ if [ ! -d .venv ]; then
   .venv/bin/python -m pip install --upgrade pip
   .venv/bin/python -m pip install -r requirements.txt || exit 1
 fi
-if ! .venv/bin/python -c "import qfluentwidgets" >/dev/null 2>&1; then
+if ! .venv/bin/python -c "import qfluentwidgets, pypandoc; pypandoc.get_pandoc_version()" >/dev/null 2>&1; then
   echo "Installing application dependencies..."
   .venv/bin/python -m pip install -r requirements.txt || exit 1
 fi

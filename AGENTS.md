@@ -2,11 +2,11 @@
 
 ## Project Structure & Modules
 
-This is a small Python desktop application; the tracked project files live at the repository root. `pdf2docx_gui.py` is the GUI and CLI entry point, and `fluent_ui.py` contains the PySide6 Fluent Widgets interface. `snip_regions.py` finds and crops tables and equations, while `polish.py` repairs document formatting after conversion. `check.py` checks converted DOCX content against its source PDF. Dependencies are listed in `requirements.txt`; `run_windows.bat` and `run_macos.sh` set up and launch the app. Focused regression tests live in `tests/`.
+This Python desktop app keeps its tracked code at the repository root. `pdf2docx_gui.py` starts the GUI and PDF CLI; `fluent_ui.py` holds the Fluent pages; `latex_to_docx.py` converts LaTeX with Pandoc. `snip_regions.py` crops PDF tables and equations, `polish.py` repairs converted documents, and `check.py` compares DOCX content with its PDF. Dependencies are in `requirements.txt`; `run_windows.bat` and `run_macos.sh` launch the app. Regression tests are in `tests/`.
 
 ## Build, Run & Validate
 
-There is no build step. Install dependencies in a virtual environment with `pip install -r requirements.txt`, then run `python pdf2docx_gui.py` to open the app. The launchers create the environment on first run and install dependencies if Fluent Widgets is missing. For scripting, use `python pdf2docx_gui.py --cli input.pdf [output.docx] [--no-images] [--no-tidy]`. Check a conversion with `python check.py input.pdf output.docx`; it exits nonzero when it finds missing text or spacing problems. Text inside cropped table or equation images is included through the image descriptions.
+There is no build step. In a virtual environment, run `pip install -r requirements.txt`, then `python pdf2docx_gui.py`. Launchers create the environment and repair missing Fluent Widgets or Pandoc dependencies. PDF scripting uses `python pdf2docx_gui.py --cli input.pdf [output.docx] [--no-images] [--no-tidy]`. The LaTeX page writes a sibling `_from_tex.docx` and uses the source folder for figures and declared bibliographies. Check PDF output with `python check.py input.pdf output.docx`.
 
 ## Coding Style & Naming
 
@@ -14,7 +14,7 @@ Use Python with four spaces per indentation level. Follow the existing `snake_ca
 
 ## Testing Guidelines
 
-Tests use the standard-library `unittest` runner; run `python -m unittest discover -s tests -v` (GUI tests use Qt's offscreen platform). Name new test modules `test_*.py`. For conversion changes, run the CLI on a representative PDF, then run `check.py` on the resulting DOCX and inspect it in Word or LibreOffice when layout is affected. For GUI changes, include a brief manual check of the relevant interaction.
+Tests use the standard-library `unittest` runner; run `python -m unittest discover -s tests -v` (GUI tests use Qt's offscreen platform). Name new test modules `test_*.py`. For PDF changes, run the CLI and `check.py` on a representative document. For LaTeX changes, verify extracted text, editable tables/math, and embedded figures in the output DOCX. For GUI changes, include a brief manual check of the relevant interaction.
 
 ## Commits & Pull Requests
 

@@ -1,12 +1,12 @@
-# PDF → DOCX Converter
+# PDF and LaTeX to DOCX Converter
 
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](#)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](#license)
 
-A lightweight, cross-platform **desktop GUI** that converts PDF files into
-editable **Word (.docx)** documents while faithfully preserving **images,
-tables, paragraphs, and page layout**.
+A cross-platform **desktop GUI** with separate PDF-to-Word and LaTeX-to-Word
+pages. It converts PDF files into editable **Word (.docx)** documents and
+converts LaTeX sources with their figures and bibliographies.
 
 No file leaves your machine — everything is converted locally.
 
@@ -14,18 +14,16 @@ No file leaves your machine — everything is converted locally.
 
 ## Features
 
-- 🖱️ **Drag & drop** a PDF onto the window, or pick one with **Browse…**
-- 📄 Choose the output `.docx` location (defaults beside the source PDF)
-- ⚙️ Converts in a **background thread** — the Fluent UI stays responsive
-- 🎨 Uses PySide6 Fluent Widgets and follows the system light/dark theme
-- 🖼️ **Images** are preserved with layout fidelity
-- 🔢 **Tables and equations kept as images** cropped from the PDF, so their
-  layout survives intact — see below
-- 💻 **`--cli`** for scripting, with no window
-- 📦 Works on **Windows, macOS, and Linux**
-- 🚀 Zero cloud dependency, fully offline
-
----
+- Choose **PDF to Word** or **LaTeX to Word** from the Fluent side navigation.
+- Drag and drop a source file onto its page, or use the Browse button.
+- Choose the output `.docx` location.
+- Keep PDF tables and equations as images for layout fidelity.
+- Convert supported LaTeX tables and equations to editable Word content
+  with Pandoc.
+- Run conversions in the background while the Fluent UI stays responsive.
+- Follow the system light or dark theme.
+- Use the PDF `--cli` option for scripting without a window.
+- Convert locally; no file leaves your machine.
 
 ## Tables and equations as images
 
@@ -50,22 +48,21 @@ authors before sending a file with images in place of tables.
 
 ## Requirements
 
-- **Python 3.9+** (3.12 recommended)
-- `pip`
+- **Python 3.9+** (3.12 recommended) and `pip`
 - PySide6 Fluent Widgets (installed from `requirements.txt`)
+- Pandoc, bundled by `pypandoc_binary` (about 41 MB for the Windows x64 wheel)
 
 The PySide6 Fluent Widgets branch is used under its upstream GPLv3 terms;
 commercial use of that toolkit requires its separate commercial license.
-
----
+Pandoc is distributed under GPL-2.0-or-later; see its [license and source](https://github.com/jgm/pandoc/blob/main/README.md#license).
 
 ## Installation & Run
 
 ### Windows
 
 Double-click **`run_windows.bat`**. It creates a virtual environment and
-installs dependencies on first run, or when Fluent Widgets is missing from an
-existing environment.
+installs dependencies on first run, or when Fluent Widgets or Pandoc is missing
+from an existing environment.
 
 ### macOS / Linux
 
@@ -90,12 +87,25 @@ python pdf2docx_gui.py
 
 ## Usage
 
-1. **Launch** the app.
-2. **Drop** a PDF onto the window (or click **Browse…**).
-3. Confirm the **output path** (defaults to `<source-name>.docx`).
-4. Decide whether to keep **tables and equations as images** (on by default).
-5. Click **Convert**.
-6. Open the `.docx` in Word / LibreOffice / Google Docs.
+1. **Launch** the app and choose **PDF to Word** or **LaTeX to Word**
+   from the side navigation.
+2. On **PDF to Word**, drop a PDF onto the page (or click **Browse PDF**).
+3. Confirm the output path (defaults to `<source-name>.docx`).
+4. Decide whether to keep tables and equations as images (on by default).
+5. Click **Convert**, then open the `.docx` in Word, LibreOffice, or Google Docs.
+
+### LaTeX to Word
+
+1. Select **LaTeX to Word** and choose or drop the main `.tex` source file.
+2. Keep its figures and bibliography in the source folder at their referenced paths.
+3. Confirm the output (defaults to `<source-name>_from_tex.docx`) and click **Convert**.
+
+Pandoc reads the source directly; a LaTeX installation is not required. It
+keeps figure captions and image proportions, creates editable Word tables and
+equations, and carries common paper-size and margin settings into Word. The
+document uses a 12 pt Times-style academic layout with 1.5 spacing. Custom
+macros or packages Pandoc does not understand may need source changes or manual
+cleanup.
 
 ### From a script
 
@@ -104,9 +114,8 @@ python pdf2docx_gui.py --cli input.pdf [output.docx] [--no-images] [--no-tidy]
 ```
 
 `--no-images` converts tables and equations as text, as the tool did before.
-`--no-tidy` skips the document cleanup pass.
-
----
+`--no-tidy` skips the document cleanup pass. The CLI currently handles PDF
+input; use the GUI page for LaTeX conversion.
 
 ## Checking the result
 
@@ -129,7 +138,8 @@ batch.
 ```text
 pdf2docx-gui/
 ├── pdf2docx_gui.py      # GUI/CLI entry point and conversion pipeline
-├── fluent_ui.py         # PySide6 Fluent Widgets interface and conversion worker
+├── fluent_ui.py         # Fluent side navigation and conversion pages
+├── latex_to_docx.py    # LaTeX-to-DOCX conversion using Pandoc
 ├── snip_regions.py      # finds tables and equations, crops them from the PDF
 ├── polish.py            # fonts, page flow, lost spaces, alignment
 ├── check.py             # compares the result against the PDF, page by page
@@ -154,6 +164,12 @@ into a native `.docx`.
 conversion badly, and replaces each with a crop of the page. `polish.py`
 repairs what conversion page by page leaves behind — substituted fonts, the
 per-page sections, the spaces lost from justified lines.
+
+---
+
+The LaTeX page calls Pandoc with the selected source folder as its resource
+path and processes declared `.bib` files with citeproc. It does not compile or
+modify the LaTeX source.
 
 ---
 
