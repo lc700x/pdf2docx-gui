@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](#)
-[![License](https://img.shields.io/badge/License-MIT-green)](#)
+[![License](https://img.shields.io/badge/License-GPL--3.0-blue)](#license)
 
 A lightweight, cross-platform **desktop GUI** that converts PDF files into
 editable **Word (.docx)** documents while faithfully preserving **images,
@@ -16,7 +16,8 @@ No file leaves your machine — everything is converted locally.
 
 - 🖱️ **Drag & drop** a PDF onto the window, or pick one with **Browse…**
 - 📄 Choose the output `.docx` location (defaults beside the source PDF)
-- ⚙️ Converts in a **background thread** — the UI stays responsive
+- ⚙️ Converts in a **background thread** — the Fluent UI stays responsive
+- 🎨 Uses PySide6 Fluent Widgets and follows the system light/dark theme
 - 🖼️ **Images** are preserved with layout fidelity
 - 🔢 **Tables and equations kept as images** cropped from the PDF, so their
   layout survives intact — see below
@@ -51,6 +52,10 @@ authors before sending a file with images in place of tables.
 
 - **Python 3.9+** (3.12 recommended)
 - `pip`
+- PySide6 Fluent Widgets (installed from `requirements.txt`)
+
+The PySide6 Fluent Widgets branch is used under its upstream GPLv3 terms;
+commercial use of that toolkit requires its separate commercial license.
 
 ---
 
@@ -59,7 +64,8 @@ authors before sending a file with images in place of tables.
 ### Windows
 
 Double-click **`run_windows.bat`**. It creates a virtual environment and
-installs all dependencies automatically on first run.
+installs dependencies on first run, or when Fluent Widgets is missing from an
+existing environment.
 
 ### macOS / Linux
 
@@ -94,10 +100,11 @@ python pdf2docx_gui.py
 ### From a script
 
 ```bash
-python pdf2docx_gui.py --cli input.pdf [output.docx] [--no-images]
+python pdf2docx_gui.py --cli input.pdf [output.docx] [--no-images] [--no-tidy]
 ```
 
 `--no-images` converts tables and equations as text, as the tool did before.
+`--no-tidy` skips the document cleanup pass.
 
 ---
 
@@ -121,13 +128,15 @@ batch.
 
 ```text
 pdf2docx-gui/
-├── pdf2docx_gui.py      # the application (Tkinter GUI + conversion)
+├── pdf2docx_gui.py      # GUI/CLI entry point and conversion pipeline
+├── fluent_ui.py         # PySide6 Fluent Widgets interface and conversion worker
 ├── snip_regions.py      # finds tables and equations, crops them from the PDF
 ├── polish.py            # fonts, page flow, lost spaces, alignment
 ├── check.py             # compares the result against the PDF, page by page
 ├── requirements.txt     # dependencies
 ├── run_windows.bat      # Windows launcher (auto venv setup)
 ├── run_macos.sh         # macOS/Linux launcher (auto venv setup)
+├── tests/               # focused regression tests
 └── README.md            # this file
 ```
 
@@ -187,4 +196,5 @@ source page by page. They are recorded because the next PDF will have them too.
 
 ## License
 
-[MIT](./LICENSE)
+Copyright (c) 2026 lc700x. This project is licensed under GNU GPLv3-only; see
+[LICENSE](./LICENSE) for the complete terms.

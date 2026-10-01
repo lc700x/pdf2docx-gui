@@ -1,2 +1,2 @@
 pdf2docx
-tkinterdnd2
+PySide6-Fluent-Widgets==1.11.3
