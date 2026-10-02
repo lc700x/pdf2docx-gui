@@ -87,21 +87,26 @@ python pdf2docx_gui.py
 
 ## Usage
 
-1. **Launch** the app and choose **PDF to Word** or **LaTeX to Word**
+1. **Launch** the app and choose **PDF to Word** or **TEX to DOCX**
    from the side navigation.
 2. On **PDF to Word**, drop a PDF onto the page (or click **Browse PDF**).
 3. Confirm the output path (defaults to `<source-name>.docx`).
 4. Decide whether to keep tables and equations as images (on by default).
-5. Click **Convert**, then open the `.docx` in Word, LibreOffice, or Google Docs.
+5. Click **Convert**, then **Open DOCX** to open the saved file in your default app.
 
-### LaTeX to Word
+### TEX to DOCX
 
-1. Select **LaTeX to Word** and choose or drop the main `.tex` source file.
+1. Select **TEX to DOCX** and choose or drop the main `.tex` source file.
 2. Keep its figures and bibliography in the source folder at their referenced paths.
 3. Confirm the output (defaults to `<source-name>_from_tex.docx`) and click **Convert**.
+4. Watch **Stages completed** and the current operation. The percentage advances
+   when a conversion stage finishes; the activity ring keeps moving while Pandoc
+   works without reporting intermediate progress.
+5. Click **Open DOCX** after saving to open the document in your default app.
 
 Pandoc reads the source directly; a LaTeX installation is not required. It
-keeps figure captions and image proportions, creates editable Word tables and
+keeps figure captions, subfigure labels such as **(a)** and **(b)**, and image
+proportions, creates editable Word tables and
 equations, and carries common paper-size and margin settings into Word. The
 document uses a 12 pt Times-style academic layout with 1.5 spacing. Custom
 macros or packages Pandoc does not understand may need source changes or manual

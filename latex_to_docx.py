@@ -1334,6 +1334,29 @@ def _subfigure_blocks(figure_record):
     return blocks
 
 
+def _subfigure_caption_records(figure_record):
+    """Number the source's non-starred panel captions within each figure."""
+    records = []
+    figure = figure_record["float"]
+    for start, end in _named_environment_ranges(figure, {"subfigure"}):
+        block = figure[start:end]
+        for match in _CAPTION_PATTERN.finditer(block):
+            if match.group(1) or _is_comment_offset(block, match.start()):
+                continue
+            cursor = match.end()
+            while cursor < len(block) and block[cursor].isspace():
+                cursor += 1
+            if cursor < len(block) and block[cursor] == "[":
+                _, cursor = _read_tex_group(block, cursor, "[", "]")
+            caption, _ = _read_tex_group(block, cursor, "{", "}")
+            if caption is not None:
+                records.append({
+                    "caption": caption.strip(),
+                    "prefix": f"({chr(ord('a') + len(records))})",
+                })
+    return records
+
+
 def _preserve_wide_subfigure_tables(source_text, output_path):
     """Keep wide LaTeX subfigures stacked and their nested tables readable."""
     document = Document(output_path)
@@ -1439,7 +1462,9 @@ def _normalized_text(text):
 
 def _prepend_caption_label(paragraph, label):
     """Insert a bold figure label without flattening existing caption runs."""
-    if re.match(r"^\s*Figure\s+\d+\.", paragraph.text, re.I):
+    if (re.match(r"^\s*" + re.escape(label) + r"(?:\s|$)", paragraph.text)
+            or (label.startswith("Figure ")
+                and re.match(r"^\s*Figure\s+\d+\.", paragraph.text, re.I))):
         return False
 
     for run in paragraph.runs:
@@ -1475,8 +1500,34 @@ def _prepend_caption_label(paragraph, label):
     return True
 
 
+def _match_caption_paragraphs(records, paragraphs):
+    if len(records) == len(paragraphs):
+        return list(zip(records, paragraphs))
+    matches = []
+    next_paragraph = 0
+    for record in records:
+        expected = _normalized_text(_plain_caption_text(record["caption"]))
+        if not expected:
+            continue
+        candidates = [
+            (SequenceMatcher(
+                None, expected, _normalized_text(paragraph.text)).ratio(),
+             index, paragraph)
+            for index, paragraph in enumerate(
+                paragraphs[next_paragraph:], next_paragraph)
+        ]
+        if not candidates:
+            break
+        similarity, index, paragraph = max(candidates, key=lambda item: item[0])
+        if similarity < 0.45:
+            continue
+        matches.append((record, paragraph))
+        next_paragraph = index + 1
+    return matches
+
+
 def _restore_figure_caption_labels(source_text, output_path):
-    """Restore numbered figure labels while retaining Pandoc's caption text."""
+    """Restore figure and panel labels while retaining caption runs and math."""
     records = _figure_caption_records(source_text)
     if not records:
         return
@@ -1484,32 +1535,16 @@ def _restore_figure_caption_labels(source_text, output_path):
     document = Document(output_path)
     paragraphs = [paragraph for paragraph in document.paragraphs
                   if paragraph.style.name == "Image Caption"]
-    if not paragraphs:
-        return
-
-    if len(records) == len(paragraphs):
-        matches = list(zip(records, paragraphs))
-    else:
-        matches = []
-        next_paragraph = 0
-        for record in records:
-            expected = _normalized_text(_plain_caption_text(record["caption"]))
-            if not expected:
-                continue
-            candidates = [
-                (SequenceMatcher(
-                    None, expected, _normalized_text(paragraph.text)).ratio(),
-                 index, paragraph)
-                for index, paragraph in enumerate(
-                    paragraphs[next_paragraph:], next_paragraph)
-            ]
-            if not candidates:
-                break
-            similarity, index, paragraph = max(candidates, key=lambda item: item[0])
-            if similarity < 0.45:
-                continue
-            matches.append((record, paragraph))
-            next_paragraph = index + 1
+    matches = _match_caption_paragraphs(records, paragraphs)
+    panel_records = [panel for record in records
+                     for panel in _subfigure_caption_records(record)]
+    panel_paragraphs = [
+        Paragraph(element, document)
+        for element in document.element.body.iter(qn("w:p"))
+        if element.getparent() is not document.element.body
+        and Paragraph(element, document).style.name == "Image Caption"
+    ]
+    matches.extend(_match_caption_paragraphs(panel_records, panel_paragraphs))
 
     changed = False
     for record, paragraph in matches:
@@ -1969,6 +2004,14 @@ def _audit_converted_document(source_text, source_dir, output_path):
                 caption[:min(7, len(caption))] in _normalized_text(paragraph.text)
                 for paragraph in matches):
             warnings.append(f"{marker[:-1]}: caption text may be incomplete.")
+        for panel in _subfigure_caption_records(record):
+            expected = _normalized_text(_plain_caption_text(panel["caption"]))
+            if not any(
+                    paragraph.text.strip().startswith(panel["prefix"])
+                    and expected[:min(7, len(expected))]
+                    in _normalized_text(paragraph.text) for paragraph in paragraphs):
+                warnings.append(
+                    f"{marker[:-1]} {panel['prefix']}: panel label or caption is missing.")
 
     label_keys = set(_LABEL_PATTERN.findall(_strip_tex_comments(source_text)))
     for key in sorted(_source_cross_reference_keys(source_text) - label_keys):
@@ -2016,8 +2059,9 @@ def _audit_converted_document(source_text, source_dir, output_path):
     return warnings
 
 
-def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warning=None):
-    """Convert a .tex source and report recoverable content warnings."""
+def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warning=None,
+                         on_progress=None):
+    """Convert a .tex source, reporting warnings and completed-stage progress."""
     source_path = os.path.abspath(source_path)
     destination_path = os.path.abspath(destination_path)
     if not os.path.isfile(source_path):
@@ -2026,6 +2070,17 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warn
         raise ValueError("Choose a LaTeX source file with the .tex extension.")
 
     warnings = []
+    completed_stages = 0
+
+    def report_status(message):
+        if on_status:
+            on_status(message)
+
+    def finish_stage():
+        nonlocal completed_stages
+        completed_stages += 1
+        if on_progress:
+            on_progress(round(completed_stages * 100 / 14))
 
     def add_warning(message):
         message = str(message).strip()
@@ -2037,8 +2092,9 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warn
             for message in warnings:
                 on_warning(message)
 
-    if on_status:
-        on_status("Converting LaTeX to Word...")
+    if on_progress:
+        on_progress(0)
+    report_status("Preparing LaTeX source...")
 
     source_dir = os.path.dirname(source_path)
     extra_args = [f"--resource-path={source_dir}"]
@@ -2065,7 +2121,10 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warn
         main_log_path = os.path.join(temp_dir, "pandoc-log.json")
         with open(temp_source_path, "w", encoding="utf-8", newline="") as temp_source:
             temp_source.write(cleaned_source)
+        finish_stage()
+        report_status("Creating Word layout...")
         _create_reference_docx(source_text, reference_docx_path)
+        finish_stage()
 
         previous_output_stat = None
         try:
@@ -2073,6 +2132,7 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warn
                                     os.stat(destination_path).st_size)
         except OSError:
             pass
+        report_status("Converting LaTeX with Pandoc...")
         try:
             pypandoc.convert_file(
                 temp_source_path,
@@ -2107,6 +2167,7 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warn
             for message in _pandoc_warning_messages(
                     main_log_path, source_path, temp_source_path):
                 add_warning(message)
+        finish_stage()
 
         repairs = (
             ("Table recovery", lambda: _restore_table_captions_and_missing_tables(
@@ -2129,17 +2190,23 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warn
                 destination_path)),
         )
         for operation, repair in repairs:
+            report_status(f"{operation}...")
             try:
                 repair()
             except Exception as exc:
                 add_warning(f"{operation}: {exc}")
+            finish_stage()
 
+        report_status("Checking DOCX content...")
         try:
             for message in _audit_converted_document(
                     source_text, source_dir, destination_path):
                 add_warning(message)
         except Exception as exc:
             add_warning(f"DOCX content audit could not finish: {exc}")
+        finish_stage()
+        report_status("Finalizing DOCX...")
 
     deliver_warnings()
+    finish_stage()
     return destination_path

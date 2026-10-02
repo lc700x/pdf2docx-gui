@@ -4,10 +4,12 @@ import tempfile
 import unittest
 import zipfile
 import zlib
+from unittest.mock import patch
 
 from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Inches, Mm
+from docx.text.paragraph import Paragraph
 
 from latex_to_docx import (
     _create_reference_docx,
@@ -23,6 +25,7 @@ from latex_to_docx import (
     _set_table_column_widths,
     _preserve_latex_table_widths,
     _preserve_wide_subfigure_tables,
+    _restore_figure_caption_labels,
     _restore_table_captions_and_missing_tables,
     _table_float_records,
     _wide_subfigure_linewidth_images,
@@ -223,9 +226,11 @@ See \citep{missing2024}.
             with open(source_path, "w", encoding="utf-8") as source_file:
                 source_file.write(source)
             warnings = []
+            progress = []
 
             result = convert_latex_to_docx(
-                source_path, destination_path, on_warning=warnings.append)
+                source_path, destination_path, on_warning=warnings.append,
+                on_progress=progress.append)
 
             self.assertEqual(result, destination_path)
             self.assertTrue(os.path.isfile(destination_path))
@@ -234,6 +239,78 @@ See \citep{missing2024}.
             self.assertTrue(any("missing-references.bib" in warning
                                 for warning in warnings))
             self.assertTrue(any("missing2024" in warning for warning in warnings))
+            self.assertEqual(progress[0], 0)
+            self.assertEqual(progress[-1], 100)
+            self.assertEqual(progress, sorted(progress))
+
+    def test_fatal_pandoc_failure_does_not_report_complete_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = os.path.join(directory, "main.tex")
+            output_path = os.path.join(directory, "main.docx")
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                source_file.write(r"\documentclass{article}\begin{document}Text\end{document}")
+            progress = []
+            with patch("latex_to_docx.pypandoc.convert_file", side_effect=RuntimeError("Pandoc failed")):
+                with self.assertRaisesRegex(RuntimeError, "Pandoc failed"):
+                    convert_latex_to_docx(source_path, output_path, on_progress=progress.append)
+
+            self.assertEqual(progress[0], 0)
+            self.assertGreater(progress[-1], 0)
+            self.assertLess(progress[-1], 100)
+            self.assertFalse(os.path.exists(output_path))
+
+    def test_subfigure_labels_reset_per_figure_and_preserve_caption_formatting(self):
+        source = r"""\documentclass{article}
+\begin{document}
+\begin{figure}
+\begin{subfigure}{0.5\textwidth}
+\begin{tabular}{lc}Left & 1 \\ \end{tabular}
+\caption[Left]{\textbf{Left panel} with $x=1$.}
+\end{subfigure}
+\begin{subfigure}{0.5\textwidth}
+\begin{tabular}{lc}Right & 2 \\ \end{tabular}
+\caption{Right panel.}
+\end{subfigure}
+\caption{First figure.}
+\end{figure}
+\begin{figure}
+\begin{subfigure}{0.5\textwidth}
+\begin{tabular}{lc}Upper & 3 \\ \end{tabular}
+\caption{Upper panel.}
+\end{subfigure}
+\begin{subfigure}{0.5\textwidth}
+\begin{tabular}{lc}Lower & 4 \\ \end{tabular}
+\caption{Lower panel.}
+\end{subfigure}
+\caption{Second figure.}
+\end{figure}
+\end{document}"""
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = os.path.join(directory, "panels.tex")
+            output_path = os.path.join(directory, "panels.docx")
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                source_file.write(source)
+            convert_latex_to_docx(source_path, output_path)
+            document = Document(output_path)
+            captions = [Paragraph(element, document)
+                        for table in document.tables
+                        for element in table._tbl.iter(qn("w:p"))
+                        if Paragraph(element, document).style.name == "Image Caption"]
+            texts = [paragraph.text for paragraph in captions]
+            self.assertEqual([text[:3] for text in texts], ["(a)", "(b)", "(a)", "(b)"])
+            self.assertIn("Left panel", texts[0])
+            self.assertTrue(any(run.bold and "Left panel" in run.text for run in captions[0].runs))
+            self.assertIsNotNone(captions[0]._p.find(".//" + qn("m:oMath")))
+            self.assertEqual([p.text for p in document.paragraphs if p.style.name == "Image Caption"],
+                             ["Figure 1. First figure.", "Figure 2. Second figure."])
+
+            _restore_figure_caption_labels(source, output_path)
+            reopened = Document(output_path)
+            repeated_texts = [Paragraph(element, reopened).text
+                              for table in reopened.tables
+                              for element in table._tbl.iter(qn("w:p"))
+                              if Paragraph(element, reopened).style.name == "Image Caption"]
+            self.assertEqual(repeated_texts, texts)
 
     def test_subfigure_tabularx_keeps_split_cells_and_declared_widths(self):
         source = r"""\documentclass{article}
@@ -489,15 +566,20 @@ See Appendix~\ref{app:details}.
 
             destination_path = os.path.join(directory, "main_from_tex.docx")
             statuses = []
+            progress = []
             with open(source_path, "rb") as source_file:
                 original_source = source_file.read()
             result = convert_latex_to_docx(
-                source_path, destination_path, on_status=statuses.append)
+                source_path, destination_path, on_status=statuses.append,
+                on_progress=progress.append)
 
             self.assertEqual(result, destination_path)
             with open(source_path, "rb") as source_file:
                 self.assertEqual(source_file.read(), original_source)
-            self.assertEqual(statuses, ["Converting LaTeX to Word..."])
+            self.assertIn("Converting LaTeX with Pandoc...", statuses)
+            self.assertIn("Checking DOCX content...", statuses)
+            self.assertEqual(statuses[-1], "Finalizing DOCX...")
+            self.assertEqual(progress, [round(stage * 100 / 14) for stage in range(15)])
             document = Document(destination_path)
             document_text = "\n".join(
                 [paragraph.text for paragraph in document.paragraphs]
