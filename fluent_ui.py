@@ -110,21 +110,25 @@ class ConversionWorker(QObject):
     """Worker object moved to a QThread; all UI updates use its signals."""
 
     statusChanged = Signal(str)
+    warningRaised = Signal(str)
     succeeded = Signal(object)
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, converter, *args, **kwargs):
+    def __init__(self, converter, *args, report_warnings=False, **kwargs):
         super().__init__()
         self.converter = converter
         self.args = args
         self.kwargs = kwargs
+        self.report_warnings = report_warnings
 
     @Slot()
     def run(self):
         try:
             kwargs = dict(self.kwargs)
             kwargs["on_status"] = self.statusChanged.emit
+            if self.report_warnings:
+                kwargs["on_warning"] = self.warningRaised.emit
             result = self.converter(*self.args, **kwargs)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -134,13 +138,16 @@ class ConversionWorker(QObject):
             self.finished.emit()
 
 
-def _start_worker(page, converter, *args, **kwargs):
+def _start_worker(page, converter, *args, report_warnings=False, **kwargs):
     page._set_busy(True)
     thread = QThread(page)
-    worker = ConversionWorker(converter, *args, **kwargs)
+    worker = ConversionWorker(
+        converter, *args, report_warnings=report_warnings, **kwargs)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.statusChanged.connect(page.status_label.setText)
+    if report_warnings:
+        worker.warningRaised.connect(page._conversion_warning)
     worker.succeeded.connect(page._conversion_succeeded)
     worker.failed.connect(page._conversion_failed)
     worker.finished.connect(thread.quit)
@@ -343,6 +350,7 @@ class TexConverterPage(QWidget):
         super().__init__(parent)
         self.converter = converter
         self.input_path = None
+        self._warnings = []
         self._thread = None
         self._worker = None
         self.setObjectName("texConverterPage")
@@ -454,8 +462,11 @@ class TexConverterPage(QWidget):
         if not destination.lower().endswith(".docx"):
             destination += ".docx"
         self.output_edit.setText(destination)
-        self.status_label.setText("Converting LaTeX…")
-        _start_worker(self, self.converter, self.input_path, destination)
+        self._warnings.clear()
+        self.status_label.setText("Converting LaTeX to Word...")
+        _start_worker(
+            self, self.converter, self.input_path, destination,
+            report_warnings=True)
 
     def _set_busy(self, busy):
         self.setAcceptDrops(not busy)
@@ -470,7 +481,16 @@ class TexConverterPage(QWidget):
         self.progress.setVisible(busy)
 
     def _conversion_succeeded(self, destination):
-        self.status_label.setText(f"Done. Saved to {destination}")
+        if self._warnings:
+            self.status_label.setText(f"Saved with warnings: {destination}")
+            MessageBox(
+                "Saved with warnings", "\n".join(self._warnings), self).exec()
+        else:
+            self.status_label.setText(f"Done. Saved to {destination}")
+
+    def _conversion_warning(self, message):
+        if message not in self._warnings:
+            self._warnings.append(message)
 
     def _conversion_failed(self, message):
         self.status_label.setText("Conversion failed")

@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -158,6 +159,45 @@ class FluentUiTests(unittest.TestCase):
 
         self.assertEqual(errors, ["page conversion failed"])
         self.assertEqual(finished, [True])
+
+    def test_tex_worker_emits_warning_signal(self):
+        warnings = []
+
+        def convert(src, dst, on_status, on_warning):
+            on_warning("Table 2: header recovery needs review")
+            return dst
+
+        worker = ConversionWorker(
+            convert, "paper.tex", "paper.docx", report_warnings=True)
+        worker.warningRaised.connect(warnings.append)
+        worker.run()
+
+        self.assertEqual(warnings, ["Table 2: header recovery needs review"])
+
+    def test_tex_page_shows_saved_with_warnings_after_worker_signal(self):
+        def convert(src, dst, on_status, on_warning):
+            on_warning("Figure 3: image path is missing.png")
+            return dst
+
+        window = ConverterWindow(lambda *args, **kwargs: {}, convert)
+        self.addCleanup(window.close)
+        page = window.tex_page
+        page.set_input("/tmp/paper.tex")
+
+        with patch("fluent_ui.MessageBox") as message_box:
+            page.start_conversion()
+            loop = QEventLoop()
+            poll = QTimer()
+            poll.timeout.connect(lambda: loop.quit() if page._thread is None else None)
+            poll.start(10)
+            QTimer.singleShot(3000, loop.quit)
+            loop.exec()
+            poll.stop()
+
+        self.assertIsNone(page._thread)
+        self.assertTrue(page.status_label.text().startswith("Saved with warnings"))
+        self.assertEqual(page._warnings, ["Figure 3: image path is missing.png"])
+        message_box.assert_called_once()
 
     def test_window_finishes_conversion_from_background_thread(self):
         def convert(src, dst, snip, tidy, on_status):

@@ -1,5 +1,6 @@
 """Convert a LaTeX source document to an editable Word document with Pandoc."""
 
+import json
 import os
 import re
 import subprocess
@@ -270,7 +271,8 @@ def _wide_subfigure_ranges(text):
             _, cursor = _read_tex_group(text, cursor, "[", "]")
         width, _ = _read_tex_group(text, cursor, "{", "}")
         ratio = re.fullmatch(
-            r"\s*(?:(\d+(?:\.\d+)?)\s*)?\\textwidth\s*", width or "")
+            r"\s*(?:(\d+(?:\.\d+)?)\s*)?\\(?:textwidth|linewidth|columnwidth)\s*",
+            width or "")
         ratio_value = float(ratio.group(1) or 1) if ratio else 0
         if not ratio or ratio_value < 0.5:
             continue
@@ -303,7 +305,9 @@ def _wide_subfigure_linewidth_images(text):
         containing = [item for item in subfigures
                       if item[0] < match.start() < item[1]]
         if (options and containing
-                and re.search(r"\bwidth\s*=\s*\\linewidth\b", options)):
+                and re.search(
+                    r"\bwidth\s*=\s*\\(?:textwidth|linewidth|columnwidth)\b",
+                    options)):
             width = max(containing, key=lambda item: item[0])[2]
             widths.append((image_index, float(width)))
         image_index += 1
@@ -629,7 +633,7 @@ def _table_float_records(text):
                 table_number += 1
             records.append({
                 "number": table_number,
-                "caption": caption,
+                "caption": caption.strip(),
                 "starred": starred,
                 "float": block,
             })
@@ -661,7 +665,7 @@ def _normalize_table_captions(text):
                 prefix = f"\\textbf{{Table {table_number}.}} "
             else:
                 prefix = ""
-            captions.append(prefix + caption)
+            captions.append(prefix + caption.strip())
             removals.append((start + match.start(), start + caption_end))
 
         if captions:
@@ -726,6 +730,86 @@ def _simplify_column_spec(spec):
             continue
         index += 1
     return "".join(columns) or "l"
+
+
+def _normalize_table_markup(text):
+    """Normalize table syntax once for Pandoc and standalone recovery passes."""
+    for start, end in reversed(_named_environment_ranges(
+            text, {"tabular", "tabularx"})):
+        block = _strip_tex_comments(text[start:end])
+        replacements = []
+        for match in _ENVIRONMENT_PATTERN.finditer(block):
+            if match.group(2) not in ("tabular", "tabularx"):
+                continue
+            operation, environment = match.groups()
+            if operation == "end":
+                if environment == "tabularx":
+                    replacements.append((match.start(), match.end(), r"\end{tabular}"))
+                continue
+
+            cursor = match.end()
+            if environment == "tabularx":
+                _, cursor = _read_tex_group(block, cursor, "{", "}")
+            spec, cursor = _read_tex_group(block, cursor, "{", "}")
+            if spec is not None:
+                replacements.append((
+                    match.start(), cursor,
+                    r"\begin{tabular}{" + _simplify_column_spec(spec) + "}"))
+
+        for begin, finish, replacement in reversed(replacements):
+            block = block[:begin] + replacement + block[finish:]
+
+        command_replacements = []
+        for match in re.finditer(r"\\makecell\b", block):
+            if _is_comment_offset(block, match.start()):
+                continue
+            cursor = match.end()
+            while cursor < len(block) and block[cursor].isspace():
+                cursor += 1
+            alignment = "c"
+            if cursor < len(block) and block[cursor] == "[":
+                options, cursor = _read_tex_group(block, cursor, "[", "]")
+                align_match = re.search(r"[lcr]", options or "")
+                if align_match:
+                    alignment = align_match.group(0)
+            body, finish = _read_tex_group(block, cursor, "{", "}")
+            if body is not None:
+                command_replacements.append((
+                    match.start(), finish,
+                    r"\begin{tabular}{" + alignment + "}"
+                    + body + r"\end{tabular}"))
+
+        for match in re.finditer(r"\\multicolumn\b", block):
+            if _is_comment_offset(block, match.start()):
+                continue
+            cursor = match.end()
+            groups = []
+            for _ in range(3):
+                group_start = cursor
+                content, cursor = _read_tex_group(block, cursor, "{", "}")
+                if content is None:
+                    groups = []
+                    break
+                while group_start < len(block) and block[group_start].isspace():
+                    group_start += 1
+                groups.append((group_start, cursor, content))
+            if groups:
+                spec_start, spec_end, spec = groups[1]
+                command_replacements.append((
+                    spec_start, spec_end,
+                    "{" + _simplify_column_spec(spec) + "}"))
+
+        for begin, finish, replacement in sorted(command_replacements, reverse=True):
+            block = block[:begin] + replacement + block[finish:]
+
+        block = re.sub(
+            r"\\(?:cmidrule|cline)\*?(?:\s*\[[^]]*\])?"
+            r"(?:\([^)]*\))?\s*\{[^}]*\}", " ", block)
+        block = re.sub(
+            r"\\addlinespace\*?(?:\s*\[[^]]*\])?", " ", block)
+        block = _normalize_tabular_rows(block)
+        text = text[:start] + block + text[end:]
+    return text
 
 
 def _normalize_minipage_tables(text):
@@ -796,41 +880,8 @@ def _normalize_tabular_rows(text):
 
 
 def _normalize_subfigure_tabularx(text):
-    """Convert subfigure tabularx blocks to Pandoc-friendly markup."""
-    for start, end in reversed(_named_environment_ranges(text, {"subfigure"})):
-        block = _normalize_tabular_rows(text[start:end])
-        text = text[:start] + block + text[end:]
-    subfigure_ranges = _named_environment_ranges(text, {"subfigure"})
-    table_ranges = _named_environment_ranges(text, {"tabularx"})
-    for start, end in reversed(table_ranges):
-        if not any(left < start and end < right
-                   for left, right in subfigure_ranges):
-            continue
-        block = text[start:end]
-        begin = next((match for match in _ENVIRONMENT_PATTERN.finditer(block)
-                      if match.groups() == ("begin", "tabularx")
-                      and not _is_comment_offset(block, match.start())), None)
-        finish = next((match for match in reversed(list(
-            _ENVIRONMENT_PATTERN.finditer(block)))
-                       if match.groups() == ("end", "tabularx")
-                       and not _is_comment_offset(block, match.start())), None)
-        if begin is None or finish is None:
-            continue
-        _, cursor = _read_tex_group(block, begin.end(), "{", "}")
-        spec, cursor = _read_tex_group(block, cursor, "{", "}")
-        if spec is None:
-            continue
-        content = block[cursor:finish.start()]
-        content = re.sub(
-            r"\\(?:toprule|midrule|bottomrule|addlinespace)\*?"
-            r"(?:\s*\[[^]]*\])?", "", content)
-        content = re.sub(
-            r"\\(?:cmidrule|cline)\*?(?:\[[^]]*\])?"
-            r"(?:\([^)]*\))?\s*\{[^}]*\}", "", content)
-        replacement = ("\\begin{tabular}{" + _simplify_column_spec(spec) + "}"
-                       + content + "\\end{tabular}")
-        text = text[:start] + replacement + text[end:]
-    return text
+    """Compatibility wrapper for the shared table normalization path."""
+    return _normalize_table_markup(text)
 
 
 def _standalone_table_sources(record, source_text):
@@ -840,7 +891,7 @@ def _standalone_table_sources(record, source_text):
     if not document_start:
         return []
     preamble = source_text[:document_start.start()]
-    caption = record["caption"]
+    caption = record["caption"].strip()
     if not record["starred"]:
         caption = f"\\textbf{{Table {record['number']}.}} " + caption
     environments = [
@@ -873,8 +924,7 @@ def _standalone_table_sources(record, source_text):
         if end_match is None:
             continue
 
-        table = ("\\begin{tabular}{" + _simplify_column_spec(column_spec) + "}"
-                 + block[cursor:end_match.start()] + "\\end{tabular}")
+        table = _normalize_table_markup(block[match.start():end_match.end()])
         sources.append(
             preamble + "\n\\begin{document}\n" + caption + "\n\n"
             + table + "\n\\end{document}\n")
@@ -1039,6 +1089,184 @@ def _set_table_column_widths(table_element, widths):
     return True
 
 
+def _set_cell_padding(cell, padding_twips):
+    cell_properties = cell.find(qn("w:tcPr"))
+    if cell_properties is None:
+        cell_properties = OxmlElement("w:tcPr")
+        cell.insert(0, cell_properties)
+    margins = cell_properties.find(qn("w:tcMar"))
+    if margins is None:
+        margins = OxmlElement("w:tcMar")
+        cell_properties.append(margins)
+    for side in ("top", "left", "bottom", "right"):
+        margin = margins.find(qn(f"w:{side}"))
+        if margin is None:
+            margin = OxmlElement(f"w:{side}")
+            margins.append(margin)
+        margin.set(qn("w:w"), str(padding_twips))
+        margin.set(qn("w:type"), "dxa")
+
+
+def _cell_horizontal_padding(cell):
+    cell_properties = cell.find(qn("w:tcPr"))
+    margins = (cell_properties.find(qn("w:tcMar"))
+               if cell_properties is not None else None)
+    if margins is None:
+        return 0
+    return sum(
+        int(margin.get(qn("w:w"), "0"))
+        for side in ("left", "right")
+        if (margin := margins.find(qn(f"w:{side}"))) is not None
+    )
+
+
+def _constrain_nested_table_widths(table_element):
+    """Fit each nested table to its merged parent cell, preserving its ratios."""
+    grid = table_element.find(qn("w:tblGrid"))
+    if grid is None:
+        return False
+    widths = [int(column.get(qn("w:w"), "0"))
+              for column in grid.findall(qn("w:gridCol"))]
+    if not widths or not all(widths):
+        return False
+
+    changed = False
+    for row in table_element.findall(qn("w:tr")):
+        column_index = 0
+        for cell in row.findall(qn("w:tc")):
+            properties = cell.find(qn("w:tcPr"))
+            span_node = (properties.find(qn("w:gridSpan"))
+                         if properties is not None else None)
+            span = int(span_node.get(qn("w:val"))) if span_node is not None else 1
+            if column_index + span > len(widths):
+                break
+            available = max(
+                1, sum(widths[column_index:column_index + span])
+                - _cell_horizontal_padding(cell))
+            column_index += span
+            for nested in cell.findall(qn("w:tbl")):
+                nested_grid = nested.find(qn("w:tblGrid"))
+                nested_widths = (
+                    [int(column.get(qn("w:w"), "0"))
+                     for column in nested_grid.findall(qn("w:gridCol"))]
+                    if nested_grid is not None else [])
+                total = sum(nested_widths)
+                if (nested_widths and all(nested_widths) and total > available):
+                    scaled = [max(1, round(width * available / total))
+                              for width in nested_widths]
+                    scaled[-1] = max(1, scaled[-1] + available - sum(scaled))
+                    changed = _set_table_column_widths(
+                        nested, [width / 1440 for width in scaled]) or changed
+                changed = _constrain_nested_table_widths(nested) or changed
+    return changed
+
+
+def _format_latex_tables(output_path):
+    """Apply compact manuscript table typography without flattening emphasis."""
+    document = Document(output_path)
+    changed = False
+    for table in document.element.iter(qn("w:tbl")):
+        properties = table.find(qn("w:tblPr"))
+        style = (properties.find(qn("w:tblStyle"))
+                 if properties is not None else None)
+        padding = 0 if style is not None and style.get(qn("w:val")) == "FigureTable" else 40
+        for cell in table.findall(f".//{qn('w:tc')}"):
+            _set_cell_padding(cell, padding)
+
+        for paragraph in table.findall(f".//{qn('w:p')}"):
+            paragraph_properties = paragraph.find(qn("w:pPr"))
+            if paragraph_properties is None:
+                paragraph_properties = OxmlElement("w:pPr")
+                paragraph.insert(0, paragraph_properties)
+            spacing = paragraph_properties.find(qn("w:spacing"))
+            if spacing is None:
+                spacing = OxmlElement("w:spacing")
+                paragraph_properties.append(spacing)
+            spacing.set(qn("w:before"), "0")
+            spacing.set(qn("w:after"), "0")
+            spacing.set(qn("w:line"), "240")
+            spacing.set(qn("w:lineRule"), "auto")
+
+        for run in table.iter(qn("w:r")):
+            run_properties = run.find(qn("w:rPr"))
+            if run_properties is None:
+                run_properties = OxmlElement("w:rPr")
+                run.insert(0, run_properties)
+            for size_name in ("w:sz", "w:szCs"):
+                size = run_properties.find(qn(size_name))
+                if size is None:
+                    size = OxmlElement(size_name)
+                    run_properties.append(size)
+                size.set(qn("w:val"), "20")
+
+        rows = table.findall(f"./{qn('w:tr')}")
+        header_rows = []
+        for row in rows:
+            row_properties = row.find(qn("w:trPr"))
+            if row_properties is None:
+                continue
+            header = row_properties.find(qn("w:tblHeader"))
+            if header is not None:
+                header.set(qn("w:val"), "true")
+                header_rows.append(row)
+        if style is None or style.get(qn("w:val")) != "FigureTable":
+            if rows and not header_rows:
+                row_properties = rows[0].find(qn("w:trPr"))
+                if row_properties is None:
+                    row_properties = OxmlElement("w:trPr")
+                    rows[0].insert(0, row_properties)
+                row_properties.append(OxmlElement("w:tblHeader"))
+        changed = True
+
+    if changed:
+        document.save(output_path)
+
+
+def _keep_table_captions_with_tables(output_path):
+    """Keep captions and their notes attached to the following native table."""
+    document = Document(output_path)
+    children = list(document.element.body)
+    changed = False
+    caption_pattern = re.compile(r"^Table\s+\d+\.")
+    for index, element in enumerate(children):
+        if element.tag != qn("w:p") or not caption_pattern.match(
+                Paragraph(element, document).text.strip()):
+            continue
+        caption_properties = element.find(qn("w:pPr"))
+        if caption_properties is None:
+            caption_properties = OxmlElement("w:pPr")
+            element.insert(0, caption_properties)
+        if caption_properties.find(qn("w:keepNext")) is None:
+            caption_properties.append(OxmlElement("w:keepNext"))
+            changed = True
+        for following in children[index + 1:]:
+            if following.tag == qn("w:tbl"):
+                break
+            if following.tag == qn("w:p"):
+                if caption_pattern.match(Paragraph(following, document).text.strip()):
+                    break
+                properties = following.find(qn("w:pPr"))
+                if properties is None:
+                    properties = OxmlElement("w:pPr")
+                    following.insert(0, properties)
+                keep_next = properties.find(qn("w:keepNext"))
+                if keep_next is None:
+                    properties.append(OxmlElement("w:keepNext"))
+                    changed = True
+
+    if changed:
+        document.save(output_path)
+
+
+def _constrain_document_nested_tables(output_path):
+    document = Document(output_path)
+    changed = False
+    for element in document.element.body.findall(qn("w:tbl")):
+        changed = _constrain_nested_table_widths(element) or changed
+    if changed:
+        document.save(output_path)
+
+
 def _preserve_latex_table_widths(source_text, output_path):
     """Apply explicit LaTeX table widths to the corresponding editable Word tables."""
     document = Document(output_path)
@@ -1130,6 +1358,12 @@ def _preserve_wide_subfigure_tables(source_text, output_path):
                 or len(rows) != 1):
             continue
         cells = rows[0].findall(qn("w:tc"))
+        cells = [cell for cell in cells if (
+            any((node.text or "").strip() for node in cell.iter(qn("w:t")))
+            or cell.find(".//" + qn("w:drawing")) is not None
+            or cell.find(".//" + qn("m:oMath")) is not None
+            or cell.find(".//" + qn("w:tbl")) is not None
+        )]
         if len(cells) != len(subfigures):
             continue
 
@@ -1170,6 +1404,20 @@ def _preserve_wide_subfigure_tables(source_text, output_path):
                 if target is None:
                     continue
                 used.add(id(target))
+                ancestor = target.getparent()
+                while ancestor is not None and ancestor is not cell:
+                    if ancestor.tag == qn("w:tbl"):
+                        ancestor_grid = ancestor.find(qn("w:tblGrid"))
+                        ancestor_columns = (
+                            ancestor_grid.findall(qn("w:gridCol"))
+                            if ancestor_grid is not None else [])
+                        if len(ancestor_columns) == 1:
+                            current_width = int(ancestor_columns[0].get(qn("w:w"), "0"))
+                            target_width = round(sum(widths) * 1440)
+                            if target_width > current_width:
+                                _set_table_column_widths(
+                                    ancestor, [sum(widths)])
+                    ancestor = ancestor.getparent()
                 changed = _set_table_column_widths(target, widths) or changed
 
     if changed:
@@ -1436,7 +1684,7 @@ def _insert_table_after_element(document, anchor, table_element):
 
 def _restore_table_captions_and_missing_tables(
         source_text, records, output_path, source_dir,
-        reference_docx_path, temp_dir):
+        reference_docx_path, temp_dir, on_warning=None):
     """Restore captions and recover native tables Pandoc silently skipped."""
     document = Document(output_path)
     changed = False
@@ -1469,6 +1717,8 @@ def _restore_table_captions_and_missing_tables(
                 temp_dir, f"fallback-table-{number}-{table_index}.tex")
             candidate_docx = os.path.join(
                 temp_dir, f"fallback-table-{number}-{table_index}.docx")
+            candidate_log = os.path.join(
+                temp_dir, f"fallback-table-{number}-{table_index}.json")
             with open(candidate_source, "w", encoding="utf-8", newline="") as source_file:
                 source_file.write(table_source)
             pypandoc.convert_file(
@@ -1479,10 +1729,14 @@ def _restore_table_captions_and_missing_tables(
                 extra_args=[
                     f"--resource-path={source_dir}",
                     f"--reference-doc={reference_docx_path}",
+                    f"--log={candidate_log}",
                     "--number-sections",
                 ],
                 cworkdir=source_dir,
             )
+            if on_warning:
+                for message in _pandoc_warning_messages(candidate_log):
+                    on_warning(message)
             candidate = Document(candidate_docx)
             if candidate.tables:
                 table = max(
@@ -1553,8 +1807,217 @@ def _bibliography_files(source_path):
     return files
 
 
-def convert_latex_to_docx(source_path, destination_path, on_status=None):
-    """Convert one .tex source and its local project resources to .docx."""
+def _bibtex_entry_titles(source_path):
+    """Read entry titles for a content audit without relying on Word bookmarks."""
+    if not os.path.isfile(source_path):
+        return {}
+    with open(source_path, encoding="utf-8", errors="replace") as source_file:
+        source = source_file.read()
+    entry_pattern = re.compile(
+        r"(?is)@\w+\s*[({]\s*([^,\s]+)\s*,(.*?)(?=\n\s*@\w+\s*[({]|\Z)")
+    title_pattern = re.compile(
+        r"(?is)\btitle\s*=\s*(\{(?:[^{}]|\{[^{}]*\})*\}|\"(?:\\.|[^\"])*\")")
+    titles = {}
+    for entry in entry_pattern.finditer(source):
+        match = title_pattern.search(entry.group(2))
+        if not match:
+            continue
+        title = match.group(1).strip()
+        if title.startswith(("{", '"')) and title.endswith(("}", '"')):
+            title = title[1:-1]
+        titles[entry.group(1)] = title
+    return titles
+
+
+def _declared_bibliography_paths(source_text, source_dir):
+    source = _strip_tex_comments(source_text)
+    paths = []
+    for declaration in _BIBLIOGRAPHY_PATTERN.finditer(source):
+        for value in declaration.group(1).split(","):
+            value = value.strip()
+            if not value:
+                continue
+            if not os.path.splitext(value)[1]:
+                value += ".bib"
+            path = os.path.abspath(os.path.join(source_dir, value))
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _source_image_paths(source_text):
+    source = _strip_tex_comments(source_text)
+    images = []
+    for match in re.finditer(r"\\includegraphics\*?", source):
+        cursor = match.end()
+        while cursor < len(source) and source[cursor].isspace():
+            cursor += 1
+        if cursor < len(source) and source[cursor] == "[":
+            _, cursor = _read_tex_group(source, cursor, "[", "]")
+        image, _ = _read_tex_group(source, cursor, "{", "}")
+        if image:
+            images.append(image.strip())
+    return images
+
+
+def _source_resource_warnings(source_text, source_dir):
+    warnings = []
+    for image in _source_image_paths(source_text):
+        if "\\" in image:
+            continue
+        image_path = os.path.abspath(os.path.join(source_dir, image))
+        candidates = ([image_path] if os.path.splitext(image_path)[1] else
+                      [image_path + extension for extension in
+                       (".pdf", ".png", ".jpg", ".jpeg", ".svg", ".eps", ".tif", ".tiff")])
+        if not any(os.path.isfile(path) for path in candidates):
+            warnings.append(f"Figure resource not found: {image}")
+
+    for path in _declared_bibliography_paths(source_text, source_dir):
+        if not os.path.isfile(path):
+            warnings.append(f"Bibliography resource not found: {path}")
+    return warnings
+
+
+def _source_citation_keys(source_text):
+    source = _strip_tex_comments(source_text)
+    pattern = re.compile(
+        r"\\(?:cite[a-zA-Z]*|[a-zA-Z]*cite[a-zA-Z]*)\*?"
+        r"(?:\s*\[[^]]*\])*\s*\{([^{}]+)\}")
+    return {
+        key.strip()
+        for match in pattern.finditer(source)
+        for key in match.group(1).split(",") if key.strip()
+    }
+
+
+def _source_cross_reference_keys(source_text):
+    source = _strip_tex_comments(source_text)
+    pattern = re.compile(
+        r"\\(?:ref|eqref|autoref|pageref|cref|Cref)\*?"
+        r"(?:\s*\[[^]]*\])*\s*\{([^{}]+)\}")
+    return {
+        key.strip()
+        for match in pattern.finditer(source)
+        for key in match.group(1).split(",") if key.strip()
+    }
+
+
+def _pandoc_warning_messages(log_path, source_path=None, temporary_source=None):
+    try:
+        with open(log_path, encoding="utf-8") as log_file:
+            messages = json.load(log_file)
+    except (OSError, ValueError, TypeError):
+        return []
+    warnings = []
+    for item in messages if isinstance(messages, list) else []:
+        if str(item.get("verbosity", "")).upper() not in ("WARNING", "ERROR"):
+            continue
+        message = str(item.get("pretty") or item.get("message") or item.get("type") or "Pandoc warning")
+        if temporary_source:
+            message = message.replace(temporary_source, source_path or temporary_source)
+        warnings.append(message)
+    return warnings
+
+
+def _audit_converted_document(source_text, source_dir, output_path):
+    """Report concrete source content that did not survive into the DOCX."""
+    document = Document(output_path)
+    warnings = []
+    docx_text = " ".join(node.text or "" for node in document.element.iter(qn("w:t")))
+    source_tables = len(_named_environment_ranges(source_text, {"tabular", "tabularx"}))
+    output_tables = sum(1 for _ in document.element.iter(qn("w:tbl")))
+    if output_tables < source_tables:
+        warnings.append(
+            f"Editable tables: source has {source_tables}; DOCX has {output_tables}. "
+            "Review the table panels for missing content.")
+
+    paragraphs = [Paragraph(element, document)
+                  for element in document.element.body.iter(qn("w:p"))]
+    for record in _table_float_records(source_text):
+        if record["starred"]:
+            continue
+        marker = f"Table {record['number']}."
+        matches = [paragraph for paragraph in paragraphs
+                   if paragraph.text.strip().startswith(marker)]
+        if not matches:
+            warnings.append(f"Table {record['number']}: caption or table was not recovered.")
+            continue
+        caption = _normalized_text(_plain_caption_text(record["caption"]))
+        if caption and not any(caption[:min(7, len(caption))]
+                               in _normalized_text(paragraph.text) for paragraph in matches):
+            warnings.append(
+                f"Table {record['number']}: caption text may be incomplete.")
+        if any(caption and _normalized_text(paragraph.text).count(caption) > 1
+               for paragraph in matches):
+            warnings.append(f"Table {record['number']}: caption text is duplicated.")
+
+    source_images = _source_image_paths(source_text)
+    output_images = len(document.inline_shapes)
+    if output_images < len(source_images):
+        warnings.append(
+            f"Figures: source references {len(source_images)} images; "
+            f"DOCX embeds {output_images}.")
+
+    for record in _figure_caption_records(source_text):
+        marker = record["prefix"]
+        caption = _normalized_text(_plain_caption_text(record["caption"]))
+        matches = [paragraph for paragraph in paragraphs
+                   if paragraph.text.strip().startswith(marker)]
+        if not matches:
+            warnings.append(f"{marker[:-1]}: caption was not recovered.")
+        elif caption and not any(
+                caption[:min(7, len(caption))] in _normalized_text(paragraph.text)
+                for paragraph in matches):
+            warnings.append(f"{marker[:-1]}: caption text may be incomplete.")
+
+    label_keys = set(_LABEL_PATTERN.findall(_strip_tex_comments(source_text)))
+    for key in sorted(_source_cross_reference_keys(source_text) - label_keys):
+        warnings.append(f"Cross-reference '{key}' has no matching source label.")
+
+    bibliography_paths = _declared_bibliography_paths(source_text, source_dir)
+    citation_keys = _source_citation_keys(source_text)
+    entry_titles = {}
+    for path in bibliography_paths:
+        if os.path.isfile(path):
+            entry_titles.update(_bibtex_entry_titles(path))
+    for key in sorted(citation_keys - set(entry_titles)):
+        warnings.append(f"Reference '{key}' is cited but missing from the bibliography resources.")
+
+    bibliography_paragraphs = [paragraph.text for paragraph in document.paragraphs
+                               if paragraph.style.name == "Bibliography"]
+    if len(bibliography_paragraphs) < len(citation_keys):
+        warnings.append(
+            f"References: {len(citation_keys)} unique citations but only "
+            f"{len(bibliography_paragraphs)} bibliography entries in the DOCX.")
+    normalized_bibliography = _normalized_text(" ".join(bibliography_paragraphs))
+    for key in sorted(citation_keys & set(entry_titles)):
+        expected_title = _normalized_text(_plain_caption_text(entry_titles[key]))
+        if len(expected_title) >= 8 and expected_title not in normalized_bibliography:
+            warnings.append(f"Reference '{key}': its title is missing from the DOCX bibliography.")
+
+    hyperlinks = {
+        node.get(qn("w:anchor")): _hyperlink_text(node)
+        for node in document.element.iter(qn("w:hyperlink"))
+        if node.get(qn("w:anchor"))
+    }
+    expected_numbers = _table_reference_numbers(source_text)
+    expected_numbers.update(_figure_reference_numbers(source_text))
+    _, appendix_numbers = _appendix_heading_records(source_text)
+    expected_numbers.update(appendix_numbers)
+    for key in sorted(_source_cross_reference_keys(source_text) & set(expected_numbers)):
+        expected = expected_numbers[key]
+        actual = hyperlinks.get(key)
+        if actual is None:
+            warnings.append(f"Cross-reference '{key}': expected Word link to {expected} is missing.")
+        elif actual != expected:
+            warnings.append(
+                f"Cross-reference '{key}': expected {expected}, DOCX shows {actual}.")
+
+    return warnings
+
+
+def convert_latex_to_docx(source_path, destination_path, on_status=None, on_warning=None):
+    """Convert a .tex source and report recoverable content warnings."""
     source_path = os.path.abspath(source_path)
     destination_path = os.path.abspath(destination_path)
     if not os.path.isfile(source_path):
@@ -1562,8 +2025,20 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None):
     if not source_path.lower().endswith(".tex"):
         raise ValueError("Choose a LaTeX source file with the .tex extension.")
 
+    warnings = []
+
+    def add_warning(message):
+        message = str(message).strip()
+        if message and message not in warnings:
+            warnings.append(message)
+
+    def deliver_warnings():
+        if on_warning:
+            for message in warnings:
+                on_warning(message)
+
     if on_status:
-        on_status("Converting LaTeX to Word…")
+        on_status("Converting LaTeX to Word...")
 
     source_dir = os.path.dirname(source_path)
     extra_args = [f"--resource-path={source_dir}"]
@@ -1575,17 +2050,29 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None):
 
     with open(source_path, encoding="utf-8", errors="replace") as source_file:
         source_text = source_file.read()
-        table_records = _table_float_records(source_text)
-        cleaned_source = _normalize_table_captions(source_text)
-        cleaned_source = _normalize_minipage_tables(cleaned_source)
-        cleaned_source = _normalize_subfigure_tabularx(cleaned_source)
-        cleaned_source = _normalize_includegraphics_options(cleaned_source)
+    for message in _source_resource_warnings(source_text, source_dir):
+        add_warning(message)
+
+    table_records = _table_float_records(source_text)
+    cleaned_source = _normalize_table_captions(source_text)
+    cleaned_source = _normalize_minipage_tables(cleaned_source)
+    cleaned_source = _normalize_table_markup(cleaned_source)
+    cleaned_source = _normalize_includegraphics_options(cleaned_source)
+
     with tempfile.TemporaryDirectory(prefix="pdf2docx-latex-") as temp_dir:
         temp_source_path = os.path.join(temp_dir, os.path.basename(source_path))
         reference_docx_path = os.path.join(temp_dir, "reference.docx")
+        main_log_path = os.path.join(temp_dir, "pandoc-log.json")
         with open(temp_source_path, "w", encoding="utf-8", newline="") as temp_source:
             temp_source.write(cleaned_source)
         _create_reference_docx(source_text, reference_docx_path)
+
+        previous_output_stat = None
+        try:
+            previous_output_stat = (os.stat(destination_path).st_mtime_ns,
+                                    os.stat(destination_path).st_size)
+        except OSError:
+            pass
         try:
             pypandoc.convert_file(
                 temp_source_path,
@@ -1594,18 +2081,65 @@ def convert_latex_to_docx(source_path, destination_path, on_status=None):
                 outputfile=destination_path,
                 extra_args=extra_args + [
                     f"--reference-doc={reference_docx_path}",
+                    f"--log={main_log_path}",
                     "--number-sections",
                 ],
                 cworkdir=source_dir,
             )
         except RuntimeError as exc:
-            raise RuntimeError(str(exc).replace(temp_source_path, source_path)) from exc
-        _restore_table_captions_and_missing_tables(
-            source_text, table_records, destination_path, source_dir,
-            reference_docx_path, temp_dir)
-        _restore_figure_caption_labels(source_text, destination_path)
-        _restore_cross_reference_numbers(source_text, destination_path)
-        _preserve_latex_table_widths(source_text, destination_path)
-        _preserve_wide_subfigure_tables(source_text, destination_path)
-        _preserve_wide_subfigure_image_widths(source_text, destination_path)
+            add_warning("Pandoc: " + str(exc).replace(temp_source_path, source_path))
+            for message in _pandoc_warning_messages(
+                    main_log_path, source_path, temp_source_path):
+                add_warning(message)
+            output_is_new = False
+            try:
+                stat = os.stat(destination_path)
+                output_is_new = (previous_output_stat is None
+                                 or (stat.st_mtime_ns, stat.st_size) != previous_output_stat)
+                Document(destination_path)
+            except (OSError, ValueError):
+                output_is_new = False
+            if not output_is_new:
+                deliver_warnings()
+                raise RuntimeError(str(exc).replace(temp_source_path, source_path)) from exc
+            add_warning(f"A usable partial DOCX was saved to {destination_path}.")
+        else:
+            for message in _pandoc_warning_messages(
+                    main_log_path, source_path, temp_source_path):
+                add_warning(message)
+
+        repairs = (
+            ("Table recovery", lambda: _restore_table_captions_and_missing_tables(
+                source_text, table_records, destination_path, source_dir,
+                reference_docx_path, temp_dir, on_warning=add_warning)),
+            ("Figure captions", lambda: _restore_figure_caption_labels(
+                source_text, destination_path)),
+            ("Cross-references", lambda: _restore_cross_reference_numbers(
+                source_text, destination_path)),
+            ("Table widths", lambda: _preserve_latex_table_widths(
+                source_text, destination_path)),
+            ("Wide figure panels", lambda: _preserve_wide_subfigure_tables(
+                source_text, destination_path)),
+            ("Figure image sizing", lambda: _preserve_wide_subfigure_image_widths(
+                source_text, destination_path)),
+            ("Table formatting", lambda: _format_latex_tables(destination_path)),
+            ("Table caption flow", lambda: _keep_table_captions_with_tables(
+                destination_path)),
+            ("Nested table widths", lambda: _constrain_document_nested_tables(
+                destination_path)),
+        )
+        for operation, repair in repairs:
+            try:
+                repair()
+            except Exception as exc:
+                add_warning(f"{operation}: {exc}")
+
+        try:
+            for message in _audit_converted_document(
+                    source_text, source_dir, destination_path):
+                add_warning(message)
+        except Exception as exc:
+            add_warning(f"DOCX content audit could not finish: {exc}")
+
+    deliver_warnings()
     return destination_path

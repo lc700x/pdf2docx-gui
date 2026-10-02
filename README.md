@@ -107,6 +107,10 @@ document uses a 12 pt Times-style academic layout with 1.5 spacing. Custom
 macros or packages Pandoc does not understand may need source changes or manual
 cleanup.
 
+If Pandoc can save a usable document while reporting missing figures, tables,
+or references, the page shows **Saved with warnings** and lists the affected
+content or resource paths. Review those items in the DOCX before using it.
+
 ### From a script
 
 ```bash
